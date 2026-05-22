@@ -35,6 +35,10 @@ where
 
 fn compare_loaded_alignments(sample_names: &[String], genes: &[Gene]) -> PairHits {
     let sample_pair_count = sample_pair_count(sample_names.len());
+    // Flatten the upper triangle of the sample-by-sample matrix into one Rayon
+    // range. That gives Rayon similarly sized units of work for each sample pair,
+    // instead of parallelizing only by the outer sample index where early rows are
+    // much larger than later rows.
     let gene_pair_hits: Vec<_> = (0..sample_pair_count)
         .into_par_iter()
         .flat_map_iter(|pair_offset| {
@@ -84,6 +88,9 @@ fn sample_pair_indices(sample_count: usize, pair_offset: usize) -> (usize, usize
     debug_assert!(sample_count >= 2);
     debug_assert!(pair_offset < sample_pair_count(sample_count));
 
+    // Find the row in the upper triangle that owns this flat offset. Row i
+    // contains pairs (i, i + 1)..(i, sample_count - 1), so pairs_before_sample()
+    // is the starting flat offset for row i.
     let mut low = 0;
     let mut high = sample_count - 2;
     while low < high {
@@ -101,6 +108,8 @@ fn sample_pair_indices(sample_count: usize, pair_offset: usize) -> (usize, usize
 }
 
 fn pairs_before_sample(sample_count: usize, sample_index: usize) -> usize {
+    // Number of upper-triangle pairs in rows before sample_index:
+    // (sample_count - 1) + (sample_count - 2) + ... + (sample_count - sample_index).
     sample_index * (2 * sample_count - sample_index - 1) / 2
 }
 
