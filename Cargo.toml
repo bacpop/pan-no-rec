@@ -3,4 +3,17 @@ name = "pangenome_recombination"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "pangenome_recombination"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+flate2 = "1.1.0"
+pyo3 = "0.28.3"
+rayon = "1.10.0"
+roaring = "0.10.12"
+seq_io = "0.3.4"
+statrs = "0.18.0"
+
+[dev-dependencies]
+tempfile = "3.19.1"
