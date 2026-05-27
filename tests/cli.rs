@@ -7,15 +7,23 @@ fn write_alignment(dir: &TempDir, name: &str, contents: &str) {
 }
 
 #[test]
-fn cli_runs_comparison_from_msa_list_without_stdout() {
+fn cli_prints_presence_absence_tsv_stably_across_thread_counts() {
     let dir = TempDir::new().unwrap();
-    write_alignment(&dir, "gene_low.aln", ">s1\nAAAAAAAAAA\n>s2\nAAAAAAAAAA\n");
+    write_alignment(
+        &dir,
+        "gene_low.aln",
+        ">beta\nAAAAAAAAAA\n>alpha\nAAAAAAAAAA\n",
+    );
     write_alignment(
         &dir,
         "gene_middle.aln",
-        ">s1\nAAAAAAAAAA\n>s2\nCAAAAAAAAA\n",
+        ">beta\nCAAAAAAAAA\n>alpha\nAAAAAAAAAA\n",
     );
-    write_alignment(&dir, "gene_high.aln", ">s1\nAAAAAAAAAA\n>s2\nCCCCCCCCAA\n");
+    write_alignment(
+        &dir,
+        "gene_high.aln",
+        ">beta\nCCCCCCCCAA\n>alpha\nAAAAAAAAAA\n",
+    );
     let list_path = dir.path().join("msa-list.txt");
     fs::write(
         &list_path,
@@ -23,11 +31,25 @@ fn cli_runs_comparison_from_msa_list_without_stdout() {
     )
     .unwrap();
 
+    let one_thread = run_cli(&list_path, "1");
+    let two_threads = run_cli(&list_path, "2");
+
+    let expected = concat!(
+        "gene\talpha\tbeta\n",
+        "gene_low\t0\t0\n",
+        "gene_middle\t0\t0\n",
+        "gene_high\t0\t0\n"
+    );
+    assert_eq!(one_thread, expected);
+    assert_eq!(two_threads, expected);
+}
+
+fn run_cli(list_path: &std::path::Path, threads: &str) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_pangenome_recombination"))
         .arg("--msa-list")
-        .arg(&list_path)
+        .arg(list_path)
         .arg("--threads")
-        .arg("2")
+        .arg(threads)
         .output()
         .unwrap();
 
@@ -36,5 +58,6 @@ fn cli_runs_comparison_from_msa_list_without_stdout() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty());
+
+    String::from_utf8(output.stdout).unwrap()
 }

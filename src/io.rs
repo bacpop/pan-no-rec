@@ -1,11 +1,14 @@
+use crate::RecombinationTable;
 use crate::error::CompareError;
 use crate::gene::Gene;
 use flate2::read::MultiGzDecoder;
 use seq_io::fasta::{Reader, Record};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::error::Error;
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 struct RawAlignment {
@@ -13,6 +16,82 @@ struct RawAlignment {
     sample_names: Vec<String>,
     sequences: Vec<Vec<u8>>,
     alignment_len: usize,
+}
+
+#[derive(Debug)]
+pub enum MsaListError {
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for MsaListError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MsaListError::Read { path, source } => {
+                write!(f, "failed to read MSA list '{}': {source}", path.display())
+            }
+        }
+    }
+}
+
+impl Error for MsaListError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            MsaListError::Read { source, .. } => Some(source),
+        }
+    }
+}
+
+pub fn read_msa_list(path: &Path) -> Result<Vec<PathBuf>, MsaListError> {
+    let contents = fs::read_to_string(path).map_err(|source| MsaListError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(parse_msa_list(path, &contents))
+}
+
+pub fn write_recombination_table<W: Write>(
+    table: &RecombinationTable,
+    mut writer: W,
+) -> Result<(), std::io::Error> {
+    write!(writer, "gene")?;
+    for sample in &table.sample_names {
+        write!(writer, "\t{sample}")?;
+    }
+    writeln!(writer)?;
+
+    for row in &table.rows {
+        write!(writer, "{}", row.gene)?;
+        for value in &row.presence {
+            write!(writer, "\t{value}")?;
+        }
+        writeln!(writer)?;
+    }
+
+    Ok(())
+}
+
+fn parse_msa_list(list_path: &Path, contents: &str) -> Vec<PathBuf> {
+    let base_dir = list_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let path = PathBuf::from(line);
+            if path.is_absolute() {
+                path
+            } else {
+                base_dir.join(path)
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn load_genes<P>(aln_paths: &[P]) -> Result<(Vec<String>, Vec<Gene>), CompareError>
@@ -285,5 +364,70 @@ mod tests {
         assert_eq!(genes[0].sample_index("s2"), Some(1));
         assert_eq!(genes[1].sample_index("s3"), Some(0));
         assert_eq!(genes[1].sample_index("s1"), Some(1));
+    }
+
+    #[test]
+    fn parse_msa_list_ignores_blank_lines_and_comments() {
+        let observed = parse_msa_list(
+            Path::new("fixtures/list.txt"),
+            "\n  \n# comment\n  # indented comment\nalpha.aln\n\nbeta.aln\n",
+        );
+
+        assert_eq!(
+            observed,
+            vec![
+                PathBuf::from("fixtures/alpha.aln"),
+                PathBuf::from("fixtures/beta.aln")
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_msa_list_resolves_relative_paths_against_list_directory() {
+        let observed = parse_msa_list(
+            Path::new("data/lists/msa.txt"),
+            "../gene.aln\nnested/gene.aln",
+        );
+
+        assert_eq!(
+            observed,
+            vec![
+                PathBuf::from("data/lists/../gene.aln"),
+                PathBuf::from("data/lists/nested/gene.aln")
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_msa_list_preserves_absolute_paths() {
+        let absolute = std::env::current_dir().unwrap().join("gene.aln");
+        let observed = parse_msa_list(Path::new("data/list.txt"), &absolute.to_string_lossy());
+
+        assert_eq!(observed, vec![absolute]);
+    }
+
+    #[test]
+    fn write_recombination_table_emits_tsv() {
+        let table = RecombinationTable {
+            sample_names: vec!["alpha".to_string(), "beta".to_string()],
+            rows: vec![
+                crate::RecombinationRow {
+                    gene: "gene1".to_string(),
+                    presence: vec![1, 0],
+                },
+                crate::RecombinationRow {
+                    gene: "gene2".to_string(),
+                    presence: vec![0, 1],
+                },
+            ],
+        };
+        let mut output = Vec::new();
+
+        write_recombination_table(&table, &mut output).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "gene\talpha\tbeta\ngene1\t1\t0\ngene2\t0\t1\n"
+        );
     }
 }

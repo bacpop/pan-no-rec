@@ -1,6 +1,7 @@
 mod error;
 mod gene;
-mod io;
+mod graph;
+pub mod io;
 mod model;
 
 use crate::gene::Gene;
@@ -16,6 +17,18 @@ pub use crate::error::CompareError;
 pub type PairHits = HashMap<String, Vec<(String, String)>>;
 type SamplePair = (String, String);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecombinationTable {
+    pub sample_names: Vec<String>,
+    pub rows: Vec<RecombinationRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecombinationRow {
+    pub gene: String,
+    pub presence: Vec<u8>,
+}
+
 pub fn compare_alignments<P>(aln_paths: &[P], threads: usize) -> Result<PairHits, CompareError>
 where
     P: AsRef<Path>,
@@ -29,6 +42,25 @@ where
     }
 
     run_with_thread_pool(threads, || compare_loaded_alignments(&sample_names, &genes))
+}
+
+pub fn infer_recombination_presence<P>(
+    aln_paths: &[P],
+    threads: usize,
+) -> Result<RecombinationTable, CompareError>
+where
+    P: AsRef<Path>,
+{
+    validate_threads(threads)?;
+
+    let (sample_names, genes) = load_genes(aln_paths)?;
+    let hits = if genes.is_empty() {
+        HashMap::new()
+    } else {
+        run_with_thread_pool(threads, || compare_loaded_alignments(&sample_names, &genes))?
+    };
+
+    Ok(presence_table_from_pair_hits(&sample_names, &genes, &hits))
 }
 
 fn compare_loaded_alignments(sample_names: &[String], genes: &[Gene]) -> PairHits {
@@ -55,6 +87,38 @@ fn compare_loaded_alignments(sample_names: &[String], genes: &[Gene]) -> PairHit
     }
 
     hits
+}
+
+fn presence_table_from_pair_hits(
+    sample_names: &[String],
+    genes: &[Gene],
+    hits: &PairHits,
+) -> RecombinationTable {
+    let sample_indices: HashMap<_, _> = sample_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect();
+    let rows = genes
+        .iter()
+        .map(|gene| {
+            let pairs = hits.get(gene.name()).map(Vec::as_slice).unwrap_or(&[]);
+
+            RecombinationRow {
+                gene: gene.name().to_owned(),
+                presence: crate::graph::infer_gene_presence(
+                    &sample_indices,
+                    sample_names.len(),
+                    pairs,
+                ),
+            }
+        })
+        .collect();
+
+    RecombinationTable {
+        sample_names: sample_names.to_vec(),
+        rows,
+    }
 }
 
 fn validate_threads(threads: usize) -> Result<(), CompareError> {
@@ -266,5 +330,48 @@ mod tests {
         let threads = run_with_thread_pool(2, rayon::current_num_threads).unwrap();
 
         assert_eq!(threads, 2);
+    }
+
+    #[test]
+    fn presence_table_keeps_all_input_genes_in_order_with_sorted_samples() {
+        let dir = TempDir::new().unwrap();
+        let paths = [
+            write_alignment(
+                &dir,
+                "gene_low.aln",
+                ">beta\nAAAAAAAAAA\n>alpha\nAAAAAAAAAA\n",
+            ),
+            write_alignment(
+                &dir,
+                "gene_middle.aln",
+                ">beta\nCAAAAAAAAA\n>alpha\nAAAAAAAAAA\n",
+            ),
+            write_alignment(
+                &dir,
+                "gene_high.aln",
+                ">beta\nCCCCCCCCAA\n>alpha\nAAAAAAAAAA\n",
+            ),
+        ];
+
+        let table = infer_recombination_presence(&paths, 1).unwrap();
+
+        assert_eq!(table.sample_names, vec!["alpha", "beta"]);
+        assert_eq!(
+            table.rows,
+            vec![
+                RecombinationRow {
+                    gene: "gene_low".to_string(),
+                    presence: vec![0, 0],
+                },
+                RecombinationRow {
+                    gene: "gene_middle".to_string(),
+                    presence: vec![0, 0],
+                },
+                RecombinationRow {
+                    gene: "gene_high".to_string(),
+                    presence: vec![0, 0],
+                },
+            ]
+        );
     }
 }

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.5.32", features = ["derive"] }
 flate2 = "1.1.0"
+petgraph = "0.8.3"
 rayon = "1.10.0"
 roaring = "0.10.12"
 seq_io = "0.3.4"
