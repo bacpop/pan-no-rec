@@ -6,12 +6,10 @@ mod model;
 use crate::gene::Gene;
 use crate::io::load_genes;
 use crate::model::{PairGeneStats, select_recombinant_gene_indices};
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub use crate::error::CompareError;
 
@@ -146,30 +144,11 @@ fn collect_comparable_pair_gene_stats<'a>(
         .collect()
 }
 
-#[pyfunction(name = "compare_alignments", signature = (aln_paths, threads=1))]
-fn compare_alignments_py(
-    py: Python<'_>,
-    aln_paths: Vec<String>,
-    threads: usize,
-) -> PyResult<PairHits> {
-    let paths: Vec<_> = aln_paths.into_iter().map(PathBuf::from).collect();
-    py.detach(|| {
-        compare_alignments(&paths, threads)
-            .map_err(|error| PyValueError::new_err(error.to_string()))
-    })
-}
-
-#[pymodule]
-fn pangenome_recombination(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(compare_alignments_py, m)?)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyo3::types::{PyDict, PyModule};
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn write_alignment(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
@@ -270,38 +249,6 @@ mod tests {
             .collect();
 
         assert_eq!(observed, vec!["gene_ab"]);
-    }
-
-    #[test]
-    fn python_api_smoke_test_returns_dict() {
-        let dir = TempDir::new().unwrap();
-        let low = write_alignment(&dir, "gene_low.aln", ">s1\nAAAAAAAAAA\n>s2\nAAAAAAAAAA\n");
-        let middle = write_alignment(
-            &dir,
-            "gene_middle.aln",
-            ">s1\nAAAAAAAAAA\n>s2\nCAAAAAAAAA\n",
-        );
-        let high = write_alignment(&dir, "gene_high.aln", ">s1\nAAAAAAAAAA\n>s2\nCCCCCCCCAA\n");
-        let paths: Vec<_> = [low, middle, high]
-            .into_iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect();
-
-        Python::initialize();
-        Python::attach(|py| {
-            let module = PyModule::new(py, "pangenome_recombination").unwrap();
-            pangenome_recombination(&module).unwrap();
-
-            let result = module
-                .getattr("compare_alignments")
-                .unwrap()
-                .call1((paths, 2usize))
-                .unwrap();
-
-            assert!(result.is_instance_of::<PyDict>());
-            let dict = result.cast::<PyDict>().unwrap();
-            assert!(dict.contains("gene_high").unwrap());
-        });
     }
 
     #[test]
