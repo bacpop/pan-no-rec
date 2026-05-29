@@ -1,9 +1,9 @@
 use crate::gene::Gene;
-use crate::model::{PairGeneStats, select_recombinant_gene_indices};
 use crate::get_progress_bar;
+use crate::model::{PairGeneStats, select_recombinant_gene_indices};
+use hashbrown::HashMap;
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
-use std::collections::HashMap;
 
 pub type PairHits = HashMap<String, Vec<(String, String)>>;
 type SamplePair = (String, String);
@@ -29,11 +29,6 @@ pub fn compare_loaded_alignments(sample_names: &[String], genes: &[Gene], quiet:
     let mut hits: PairHits = HashMap::new();
     for (gene, pair) in gene_pair_hits {
         hits.entry(gene).or_default().push(pair);
-    }
-
-    // TODO: why is this needed?
-    for pairs in hits.values_mut() {
-        pairs.sort();
     }
 
     hits
@@ -128,6 +123,13 @@ mod tests {
         (sample_names, genes, hits)
     }
 
+    // Normalizes Rayon-collected hit order for tests that compare pair vectors.
+    fn sort_pair_hits(hits: &mut PairHits) {
+        for pairs in hits.values_mut() {
+            pairs.sort();
+        }
+    }
+
     fn infer_recombination_presence<P>(aln_paths: &[P]) -> RecombinationTable
     where
         P: AsRef<Path>,
@@ -172,7 +174,8 @@ mod tests {
             ));
         }
 
-        let hits = compare_alignments(&paths);
+        let mut hits = compare_alignments(&paths);
+        sort_pair_hits(&mut hits.2);
         let mut observed: Vec<_> = hits.2.keys().cloned().collect();
         observed.sort();
 
@@ -212,7 +215,8 @@ mod tests {
             ));
         }
 
-        let hits = compare_alignments(&paths);
+        let mut hits = compare_alignments(&paths);
+        sort_pair_hits(&mut hits.2);
         let mut observed: Vec<_> = hits.2.keys().cloned().collect();
         observed.sort();
 

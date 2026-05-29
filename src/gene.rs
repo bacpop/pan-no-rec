@@ -1,5 +1,5 @@
+use hashbrown::HashMap;
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default)]
 struct SampleBases {

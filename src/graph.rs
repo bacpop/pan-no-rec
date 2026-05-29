@@ -1,8 +1,8 @@
+use crate::get_progress_bar;
+use hashbrown::HashMap;
+use indicatif::ParallelProgressIterator;
 use petgraph::graph::{NodeIndex, UnGraph};
 use rayon::prelude::*;
-use crate::get_progress_bar;
-use indicatif::ParallelProgressIterator;
-use std::collections::HashMap;
 
 use crate::dists::PairHits;
 use crate::gene::Gene;

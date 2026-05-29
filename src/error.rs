@@ -1,3 +1,5 @@
+use crate::io::MsaListError;
+use rayon::ThreadPoolBuildError;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;

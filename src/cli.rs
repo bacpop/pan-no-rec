@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Find recombination from pangenome alignments")]
-struct Args {
+pub(crate) struct Args {
     #[arg(long, value_name = "PATH")]
     pub msa_list: PathBuf,
 

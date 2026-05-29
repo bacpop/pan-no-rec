@@ -1,6 +1,6 @@
 use anyhow::{Error, anyhow};
-use rayon::ThreadPoolBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::ThreadPoolBuilder;
 
 use std::io::stdout;
 use std::time::Instant;
