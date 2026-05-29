@@ -1,7 +1,56 @@
 use petgraph::graph::{NodeIndex, UnGraph};
+use rayon::prelude::*;
 use std::collections::HashMap;
 
+use crate::dists::PairHits;
+use crate::gene::Gene;
+
 type RecombinationGraph = UnGraph<usize, ()>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecombinationTable {
+    pub sample_names: Vec<String>,
+    pub rows: Vec<RecombinationRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecombinationRow {
+    pub gene: String,
+    pub presence: Vec<u8>,
+}
+
+// Builds the public presence table from pairwise recombinant hits.
+pub fn presence_table_from_pair_hits(
+    sample_names: &[String],
+    genes: &[Gene],
+    hits: &PairHits,
+) -> RecombinationTable {
+    let sample_indices: HashMap<_, _> = sample_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect();
+    let rows = genes
+        .par_iter()
+        .map(|gene| {
+            let pairs = hits.get(gene.name()).map(Vec::as_slice).unwrap_or(&[]);
+
+            RecombinationRow {
+                gene: gene.name().to_owned(),
+                presence: crate::graph::infer_gene_presence(
+                    &sample_indices,
+                    sample_names.len(),
+                    pairs,
+                ),
+            }
+        })
+        .collect();
+
+    RecombinationTable {
+        sample_names: sample_names.to_vec(),
+        rows,
+    }
+}
 
 // Infers sample-level recombination presence from pairwise gene hits.
 pub(crate) fn infer_gene_presence(

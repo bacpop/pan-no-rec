@@ -49,7 +49,7 @@ fn cli_prints_presence_absence_tsv_stably_across_thread_counts() {
 #[test]
 // Verifies clap rejects invalid thread counts before inference starts.
 fn cli_rejects_zero_threads() {
-    let output = Command::new(env!("CARGO_BIN_EXE_pangenome_recombination"))
+    let output = Command::new(env!("CARGO_BIN_EXE_pan-no-rec"))
         .arg("--msa-list")
         .arg("unused.txt")
         .arg("--threads")
@@ -67,7 +67,7 @@ fn cli_rejects_zero_threads() {
 
 // Runs the binary with one MSA list and thread count.
 fn run_cli(list_path: &std::path::Path, threads: &str) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_pangenome_recombination"))
+    let output = Command::new(env!("CARGO_BIN_EXE_pan-no-rec"))
         .arg("--msa-list")
         .arg(list_path)
         .arg("--threads")

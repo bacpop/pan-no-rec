@@ -1,6 +1,6 @@
-use crate::RecombinationTable;
 use crate::error::CompareError;
 use crate::gene::Gene;
+use crate::graph::RecombinationTable;
 use flate2::read::MultiGzDecoder;
 use seq_io::fasta::{Reader, Record};
 use std::collections::HashSet;
@@ -435,11 +435,11 @@ mod tests {
         let table = RecombinationTable {
             sample_names: vec!["alpha".to_string(), "beta".to_string()],
             rows: vec![
-                crate::RecombinationRow {
+                crate::graph::RecombinationRow {
                     gene: "gene1".to_string(),
                     presence: vec![1, 0],
                 },
-                crate::RecombinationRow {
+                crate::graph::RecombinationRow {
                     gene: "gene2".to_string(),
                     presence: vec![0, 1],
                 },

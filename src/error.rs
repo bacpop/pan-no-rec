@@ -3,6 +3,64 @@ use std::fmt;
 use std::path::PathBuf;
 
 #[derive(Debug)]
+pub enum CliError {
+    ReadMsaList(MsaListError),
+    WriteStdout {
+        source: std::io::Error,
+    },
+    ThreadPoolBuild {
+        threads: usize,
+        source: ThreadPoolBuildError,
+    },
+    Compare(CompareError),
+}
+
+impl fmt::Display for CliError {
+    // Formats CLI errors as user-facing messages.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CliError::ReadMsaList(error) => write!(f, "{error}"),
+            CliError::WriteStdout { source } => {
+                write!(f, "failed to write recombination table to stdout: {source}")
+            }
+            CliError::ThreadPoolBuild { threads, source } => {
+                write!(
+                    f,
+                    "failed to initialize Rayon global thread pool with {threads} threads: {source}"
+                )
+            }
+            CliError::Compare(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for CliError {
+    // Exposes wrapped errors for standard error chaining.
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            CliError::ReadMsaList(error) => Some(error),
+            CliError::WriteStdout { source } => Some(source),
+            CliError::ThreadPoolBuild { source, .. } => Some(source),
+            CliError::Compare(error) => Some(error),
+        }
+    }
+}
+
+impl From<MsaListError> for CliError {
+    // Converts MSA-list failures into the CLI error type.
+    fn from(error: MsaListError) -> Self {
+        CliError::ReadMsaList(error)
+    }
+}
+
+impl From<CompareError> for CliError {
+    // Converts recombination failures into the CLI error type.
+    fn from(error: CompareError) -> Self {
+        CliError::Compare(error)
+    }
+}
+
+#[derive(Debug)]
 pub enum CompareError {
     Io {
         path: PathBuf,

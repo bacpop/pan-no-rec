@@ -1,16 +1,21 @@
 [package]
-name = "pangenome_recombination"
+name = "pan-no-rec"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.32", features = ["derive"] }
+hashbrown = { version = "0.14", features = ["rayon", "serde"] }
 flate2 = "1.1.0"
 petgraph = "0.8.3"
 rayon = "1.10.0"
 roaring = "0.10.12"
 seq_io = "0.3.4"
 statrs = "0.18.0"
+anyhow = "1.0"
+log = "0.4"
+simple_logger = { version = "4", features = ["stderr"] }
+indicatif = { version = "0.17", features = ["rayon", "improved_unicode"]}
 
 [dev-dependencies]
 tempfile = "3.19.1"

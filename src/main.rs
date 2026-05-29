@@ -1,8 +1,6 @@
-mod cli;
-
-use std::process::ExitCode;
+use anyhow::Error;
 
 // Delegates process startup to the CLI module.
-fn main() -> ExitCode {
-    cli::launch()
+fn main() -> Result<(), Error> {
+    pan_no_rec::main()
 }
