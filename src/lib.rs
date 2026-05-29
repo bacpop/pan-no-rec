@@ -67,7 +67,7 @@ pub fn main() -> Result<()> {
         (None, Some(path)) => read_panaroo_dir(path)?,
         _ => unreachable!("clap requires exactly one input source"),
     };
-    let (sample_names, genes) = load_genes(&aln_paths)?;
+    let (sample_names, genes) = load_genes(&aln_paths, args.paralog_mode)?;
     if genes.is_empty() {
         bail!("No valid genes loaded");
     } else if sample_names.is_empty() {

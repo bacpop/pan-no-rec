@@ -1,6 +1,31 @@
-use clap::{ArgGroup, Parser};
+use clap::{ArgGroup, Parser, ValueEnum};
 
+use std::fmt;
 use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum ParalogMode {
+    First,
+    Skip,
+    Longest,
+}
+
+impl ParalogMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ParalogMode::First => "first",
+            ParalogMode::Skip => "skip",
+            ParalogMode::Longest => "longest",
+        }
+    }
+}
+
+impl fmt::Display for ParalogMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Find recombination from pangenome alignments")]
@@ -19,6 +44,9 @@ pub(crate) struct Args {
 
     #[arg(long, default_value_t = 1, value_parser = parse_threads)]
     pub threads: usize,
+
+    #[arg(long, value_enum, default_value_t = ParalogMode::First)]
+    pub paralog_mode: ParalogMode,
 
     /// Show progress messages
     #[arg(short, long, global = true)]

@@ -108,6 +108,7 @@ fn collect_comparable_pair_gene_stats<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::ParalogMode;
     use crate::graph::{RecombinationRow, RecombinationTable};
     use crate::{load_genes, presence_table_from_pair_hits};
     use std::fs;
@@ -118,7 +119,8 @@ mod tests {
     where
         P: AsRef<Path>,
     {
-        let (sample_names, genes) = load_genes(aln_paths).expect("Test gene load failed");
+        let (sample_names, genes) =
+            load_genes(aln_paths, ParalogMode::First).expect("Test gene load failed");
         let hits = compare_loaded_alignments(&sample_names, &genes, true);
         (sample_names, genes, hits)
     }
@@ -235,7 +237,8 @@ mod tests {
         let gene_ab = write_alignment(&dir, "gene_ab.aln", ">alpha\nAAAA\n>beta\nCCCC\n");
         let gene_ag = write_alignment(&dir, "gene_ag.aln", ">alpha\nAAAA\n>gamma\nTTTT\n");
         let gene_bg = write_alignment(&dir, "gene_bg.aln", ">beta\nCCCC\n>gamma\nTTTT\n");
-        let (_sample_names, genes) = crate::io::load_genes(&[gene_ab, gene_ag, gene_bg]).unwrap();
+        let (_sample_names, genes) =
+            crate::io::load_genes(&[gene_ab, gene_ag, gene_bg], ParalogMode::First).unwrap();
 
         let observed: Vec<_> = collect_comparable_pair_gene_stats(&genes, "alpha", "beta")
             .into_iter()

@@ -1,9 +1,10 @@
+use crate::cli::ParalogMode;
 use crate::gene::Gene;
 use crate::graph::RecombinationTable;
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use seq_io::fasta::{Reader, Record};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,18 @@ struct RawAlignment {
     sample_names: Vec<String>,
     sequences: Vec<Vec<u8>>,
     alignment_len: usize,
+}
+
+#[derive(Debug)]
+struct RawSampleGroup {
+    sample_name: String,
+    records: Vec<RawSampleRecord>,
+}
+
+#[derive(Debug)]
+struct RawSampleRecord {
+    sequence: Vec<u8>,
+    non_gap_count: usize,
 }
 
 // Reads an MSA list file and resolves its entries to paths.
@@ -137,7 +150,10 @@ fn parse_msa_list(list_path: &Path, contents: &str) -> Vec<PathBuf> {
 }
 
 // Loads all input alignments into genes and sorted sample names.
-pub(crate) fn load_genes<P>(aln_paths: &[P]) -> Result<(Vec<String>, Vec<Gene>)>
+pub(crate) fn load_genes<P>(
+    aln_paths: &[P],
+    paralog_mode: ParalogMode,
+) -> Result<(Vec<String>, Vec<Gene>)>
 where
     P: AsRef<Path>,
 {
@@ -145,7 +161,7 @@ where
     let mut all_samples = HashSet::new();
 
     for aln_path in aln_paths {
-        let raw = parse_raw_alignment(aln_path.as_ref())?;
+        let raw = parse_raw_alignment(aln_path.as_ref(), paralog_mode)?;
         all_samples.extend(raw.sample_names.iter().cloned());
         genes.push(build_gene(raw));
     }
@@ -167,14 +183,13 @@ fn build_gene(raw: RawAlignment) -> Gene {
 }
 
 // Parses one FASTA alignment and validates its records.
-fn parse_raw_alignment(path: &Path) -> Result<RawAlignment> {
+fn parse_raw_alignment(path: &Path, paralog_mode: ParalogMode) -> Result<RawAlignment> {
     let path = path.to_path_buf();
     let gene_name = gene_name_from_path(&path)?;
     let reader = open_alignment_reader(&path)?;
     let mut reader = Reader::new(reader);
-    let mut sample_names = Vec::new();
-    let mut sequences = Vec::new();
-    let mut seen_samples = HashSet::new();
+    let mut sample_groups: Vec<RawSampleGroup> = Vec::new();
+    let mut sample_group_indices: HashMap<String, usize> = HashMap::new();
     let mut alignment_len = None;
 
     while let Some(record) = reader.next() {
@@ -187,13 +202,6 @@ fn parse_raw_alignment(path: &Path) -> Result<RawAlignment> {
                 path.display()
             )
         })?);
-
-        if !seen_samples.insert(sample.clone()) {
-            bail!(
-                "alignment '{}' contains duplicate sample header '{sample}'",
-                path.display()
-            );
-        }
 
         let sequence = record.full_seq();
         let observed_len = sequence.len();
@@ -224,13 +232,45 @@ fn parse_raw_alignment(path: &Path) -> Result<RawAlignment> {
             None => alignment_len = Some(observed_len),
         }
 
-        sample_names.push(sample);
-        sequences.push(sequence.into_owned());
+        let sequence = sequence.into_owned();
+        let record = RawSampleRecord {
+            non_gap_count: non_gap_count(&sequence),
+            sequence,
+        };
+
+        match sample_group_indices.entry(sample.clone()) {
+            Entry::Occupied(entry) => {
+                sample_groups[*entry.get()].records.push(record);
+            }
+            Entry::Vacant(entry) => {
+                let group_index = sample_groups.len();
+                entry.insert(group_index);
+                sample_groups.push(RawSampleGroup {
+                    sample_name: sample,
+                    records: vec![record],
+                });
+            }
+        }
     }
 
     let Some(alignment_len) = alignment_len else {
         bail!("alignment '{}' contains no FASTA records", path.display());
     };
+
+    let affected_sample_count = sample_groups
+        .iter()
+        .filter(|group| group.records.len() > 1)
+        .count();
+    let (sample_names, sequences) = resolve_paralogs(sample_groups, paralog_mode);
+
+    if affected_sample_count > 0 {
+        log::warn!(
+            "alignment '{}' contains paralogs for {} samples; using paralog mode '{}'",
+            gene_name,
+            affected_sample_count,
+            paralog_mode
+        );
+    }
 
     Ok(RawAlignment {
         gene_name,
@@ -238,6 +278,57 @@ fn parse_raw_alignment(path: &Path) -> Result<RawAlignment> {
         sequences,
         alignment_len,
     })
+}
+
+// Resolves duplicate normalized sample IDs according to the selected mode.
+fn resolve_paralogs(
+    sample_groups: Vec<RawSampleGroup>,
+    paralog_mode: ParalogMode,
+) -> (Vec<String>, Vec<Vec<u8>>) {
+    let mut sample_names = Vec::with_capacity(sample_groups.len());
+    let mut sequences = Vec::with_capacity(sample_groups.len());
+
+    for group in sample_groups {
+        let Some(sequence) = resolve_sample_group(group.records, paralog_mode) else {
+            continue;
+        };
+
+        sample_names.push(group.sample_name);
+        sequences.push(sequence);
+    }
+
+    (sample_names, sequences)
+}
+
+// Selects the sequence to keep for a single normalized sample group.
+fn resolve_sample_group(
+    mut records: Vec<RawSampleRecord>,
+    paralog_mode: ParalogMode,
+) -> Option<Vec<u8>> {
+    debug_assert!(!records.is_empty());
+
+    match paralog_mode {
+        ParalogMode::First => Some(records.remove(0).sequence),
+        ParalogMode::Skip if records.len() > 1 => None,
+        ParalogMode::Skip => Some(records.remove(0).sequence),
+        ParalogMode::Longest => {
+            let mut best_index = 0;
+            let mut best_non_gap_count = records[0].non_gap_count;
+            for (index, record) in records.iter().enumerate().skip(1) {
+                if record.non_gap_count > best_non_gap_count {
+                    best_index = index;
+                    best_non_gap_count = record.non_gap_count;
+                }
+            }
+
+            Some(records.swap_remove(best_index).sequence)
+        }
+    }
+}
+
+// Counts non-gap characters for longest-paralog resolution.
+fn non_gap_count(sequence: &[u8]) -> usize {
+    sequence.iter().filter(|&&base| base != b'-').count()
 }
 
 // Normalizes a FASTA record identifier to its sample name.
@@ -305,7 +396,7 @@ fn strip_extension(name: &mut String, extension: &str) {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     // Writes a temporary alignment file and returns its path.
@@ -313,6 +404,11 @@ mod tests {
         let path = dir.path().join(name);
         fs::write(&path, contents).unwrap();
         path
+    }
+
+    // Parses a temporary alignment with the default paralog behavior.
+    fn parse_default(path: &Path) -> Result<RawAlignment> {
+        parse_raw_alignment(path, ParalogMode::First)
     }
 
     #[test]
@@ -325,7 +421,7 @@ mod tests {
             ">sample1\nACGT\n>sample2 description\nTGCA\n",
         );
 
-        let raw = parse_raw_alignment(&path).unwrap();
+        let raw = parse_default(&path).unwrap();
         assert_eq!(raw.gene_name, "gene");
         assert_eq!(raw.alignment_len, 4);
         assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
@@ -338,7 +434,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(&dir, "gene.aln.fas", ">sample1\nACGT\n>sample2\nTGCA\n");
 
-        let raw = parse_raw_alignment(&path).unwrap();
+        let raw = parse_default(&path).unwrap();
 
         assert_eq!(raw.gene_name, "gene");
     }
@@ -353,26 +449,88 @@ mod tests {
             ">cl7_bakta;4_0_1479\nACGT\n>cl3_bakta;2_1_12 description\nTGCA\n",
         );
 
-        let raw = parse_raw_alignment(&path).unwrap();
+        let raw = parse_default(&path).unwrap();
 
         assert_eq!(raw.sample_names, vec!["cl7_bakta", "cl3_bakta"]);
     }
 
     #[test]
-    // Verifies duplicate normalized sample IDs are rejected.
-    fn parser_rejects_duplicate_normalized_sample_ids() {
+    // Verifies duplicate normalized sample IDs keep the first sequence by default.
+    fn parser_keeps_first_duplicate_normalized_sample_id_by_default() {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(
             &dir,
             "gene.aln",
-            ">sample1;first\nACGT\n>sample1;second\nTGCA\n",
+            ">sample1;first\nACGT\n>sample2\nCCCC\n>sample1;second\nTGCA\n",
         );
 
-        let error = parse_raw_alignment(&path).unwrap_err();
+        let raw = parse_default(&path).unwrap();
+
+        assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
+        assert_eq!(raw.sequences, vec![b"ACGT".to_vec(), b"CCCC".to_vec()]);
+    }
+
+    #[test]
+    // Verifies skip mode removes duplicated samples from that gene.
+    fn parser_skip_mode_removes_duplicated_samples() {
+        let dir = TempDir::new().unwrap();
+        let path = write_alignment(
+            &dir,
+            "gene.aln",
+            ">sample1;first\nACGT\n>sample2\nCCCC\n>sample1;second\nTGCA\n>sample3\nGGGG\n",
+        );
+
+        let raw = parse_raw_alignment(&path, ParalogMode::Skip).unwrap();
+
+        assert_eq!(raw.sample_names, vec!["sample2", "sample3"]);
+        assert_eq!(raw.sequences, vec![b"CCCC".to_vec(), b"GGGG".to_vec()]);
+    }
+
+    #[test]
+    // Verifies longest mode keeps the duplicate with the most non-gap bytes.
+    fn parser_longest_mode_keeps_duplicate_with_most_non_gap_bases() {
+        let dir = TempDir::new().unwrap();
+        let path = write_alignment(
+            &dir,
+            "gene.aln",
+            ">sample1;short\nAA--\n>sample2\nCCCC\n>sample1;long\nA-CG\n",
+        );
+
+        let raw = parse_raw_alignment(&path, ParalogMode::Longest).unwrap();
+
+        assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
+        assert_eq!(raw.sequences, vec![b"A-CG".to_vec(), b"CCCC".to_vec()]);
+    }
+
+    #[test]
+    // Verifies longest mode keeps the first duplicate when non-gap counts tie.
+    fn parser_longest_mode_keeps_first_duplicate_on_equal_non_gap_count() {
+        let dir = TempDir::new().unwrap();
+        let path = write_alignment(
+            &dir,
+            "gene.aln",
+            ">sample1;first\nA--C\n>sample1;second\nG--T\n",
+        );
+
+        let raw = parse_raw_alignment(&path, ParalogMode::Longest).unwrap();
+
+        assert_eq!(raw.sample_names, vec!["sample1"]);
+        assert_eq!(raw.sequences, vec![b"A--C".to_vec()]);
+    }
+
+    #[test]
+    // Verifies malformed duplicate records are still validated before resolution.
+    fn parser_rejects_variable_sequence_lengths_in_duplicate_records() {
+        let dir = TempDir::new().unwrap();
+        let path = write_alignment(
+            &dir,
+            "gene.aln",
+            ">sample1;first\nACGT\n>sample1;second\nACG\n",
+        );
+
+        let error = parse_raw_alignment(&path, ParalogMode::First).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("duplicate sample header 'sample1'"),
+            error.to_string().contains("variable sequence lengths"),
             "error: {error}"
         );
     }
@@ -383,7 +541,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(&dir, "gene.aln", ">sample1\nACGT\n>sample2\nACG\n");
 
-        let error = parse_raw_alignment(&path).unwrap_err();
+        let error = parse_default(&path).unwrap_err();
         let message = error.to_string();
         assert!(
             message.contains("variable sequence lengths"),
@@ -400,7 +558,7 @@ mod tests {
         let gene_a = write_alignment(&dir, "gene_a.aln", ">s1\nAAAA\n>s2\nCCCC\n");
         let gene_b = write_alignment(&dir, "gene_b.aln", ">s2\nCCCC\n>s1\nAAAA\n");
 
-        let (sample_names, genes) = load_genes(&[gene_a, gene_b]).unwrap();
+        let (sample_names, genes) = load_genes(&[gene_a, gene_b], ParalogMode::First).unwrap();
 
         assert_eq!(sample_names, vec!["s1", "s2"]);
         assert_eq!(genes.len(), 2);
@@ -427,7 +585,7 @@ mod tests {
             ">s3;contig_b\nCCCC\n>s1;contig_b\nAAAA\n",
         );
 
-        let (sample_names, genes) = load_genes(&[gene_a, gene_b]).unwrap();
+        let (sample_names, genes) = load_genes(&[gene_a, gene_b], ParalogMode::First).unwrap();
 
         assert_eq!(sample_names, vec!["s1", "s2", "s3"]);
         assert_eq!(genes.len(), 2);
