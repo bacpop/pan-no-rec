@@ -9,7 +9,7 @@ mod cli;
 use crate::cli::cli_args;
 
 mod io;
-use io::{load_genes, read_msa_list, write_recombination_table};
+use io::{load_genes, read_msa_list, read_panaroo_dir, write_recombination_table};
 
 mod dists;
 use dists::compare_loaded_alignments;
@@ -62,7 +62,11 @@ pub fn main() -> Result<()> {
     let start = Instant::now();
 
     log::info!("Getting input files");
-    let aln_paths = read_msa_list(&args.msa_list)?;
+    let aln_paths = match (&args.msa_list, &args.panaroo_dir) {
+        (Some(path), None) => read_msa_list(path)?,
+        (None, Some(path)) => read_panaroo_dir(path)?,
+        _ => unreachable!("clap requires exactly one input source"),
+    };
     let (sample_names, genes) = load_genes(&aln_paths)?;
     if genes.is_empty() {
         bail!("No valid genes loaded");

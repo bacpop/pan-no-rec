@@ -23,6 +23,75 @@ pub fn read_msa_list(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(parse_msa_list(path, &contents))
 }
 
+// Finds Panaroo gene alignment files in a directory or its standard fallback.
+pub fn read_panaroo_dir(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = find_panaroo_alignments(path)?;
+    if paths.is_empty() {
+        let fallback = path.join("aligned_gene_sequences");
+        paths = find_optional_panaroo_alignments(&fallback)?;
+    }
+
+    if paths.is_empty() {
+        bail!(
+            "found no Panaroo alignment files ending in .aln.fas in '{}' or '{}'",
+            path.display(),
+            path.join("aligned_gene_sequences").display()
+        );
+    }
+
+    Ok(paths)
+}
+
+// Collects top-level Panaroo alignment files from a readable directory.
+fn find_panaroo_alignments(dir: &Path) -> Result<Vec<PathBuf>> {
+    collect_panaroo_alignments(dir, true)
+}
+
+// Collects Panaroo alignment files from an optional fallback directory.
+fn find_optional_panaroo_alignments(dir: &Path) -> Result<Vec<PathBuf>> {
+    collect_panaroo_alignments(dir, false)
+}
+
+fn collect_panaroo_alignments(dir: &Path, required: bool) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read Panaroo directory '{}'", dir.display()));
+        }
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read an entry in Panaroo directory '{}'",
+                dir.display()
+            )
+        })?;
+        let file_type = entry.file_type().with_context(|| {
+            format!(
+                "failed to read file type for Panaroo path '{}'",
+                entry.path().display()
+            )
+        })?;
+        if file_type.is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".aln.fas"))
+        {
+            paths.push(entry.path());
+        }
+    }
+
+    paths.sort();
+    Ok(paths)
+}
+
 // Writes a recombination presence table as tab-separated text.
 pub fn write_recombination_table<W: Write>(
     table: &RecombinationTable,
@@ -203,7 +272,7 @@ fn gene_name_from_path(path: &Path) -> Result<String> {
         strip_extension(&mut name, suffix);
     }
 
-    for suffix in ["aln", "fa", "fasta", "fna", "fas"] {
+    for suffix in ["aln.fas", "aln", "fa", "fasta", "fna", "fas"] {
         strip_extension(&mut name, suffix);
     }
 
@@ -261,6 +330,17 @@ mod tests {
         assert_eq!(raw.alignment_len, 4);
         assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
         assert_eq!(raw.sequences.len(), 2);
+    }
+
+    #[test]
+    // Verifies Panaroo compound suffixes are stripped from gene names.
+    fn parser_strips_panaroo_alignment_suffix_from_gene_name() {
+        let dir = TempDir::new().unwrap();
+        let path = write_alignment(&dir, "gene.aln.fas", ">sample1\nACGT\n>sample2\nTGCA\n");
+
+        let raw = parse_raw_alignment(&path).unwrap();
+
+        assert_eq!(raw.gene_name, "gene");
     }
 
     #[test]
@@ -398,6 +478,56 @@ mod tests {
         let observed = parse_msa_list(Path::new("data/list.txt"), &absolute.to_string_lossy());
 
         assert_eq!(observed, vec![absolute]);
+    }
+
+    #[test]
+    // Verifies Panaroo discovery uses sorted top-level .aln.fas files first.
+    fn read_panaroo_dir_uses_sorted_top_level_aln_fas_files() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("alpha.aln.fas");
+        let second = dir.path().join("zeta.aln.fas");
+        fs::write(&second, "").unwrap();
+        fs::write(dir.path().join("ignored.fas"), "").unwrap();
+        fs::write(&first, "").unwrap();
+
+        let fallback = dir.path().join("aligned_gene_sequences");
+        fs::create_dir(&fallback).unwrap();
+        fs::write(fallback.join("fallback.aln.fas"), "").unwrap();
+
+        let observed = read_panaroo_dir(dir.path()).unwrap();
+
+        assert_eq!(observed, vec![first, second]);
+    }
+
+    #[test]
+    // Verifies Panaroo discovery falls back to aligned_gene_sequences.
+    fn read_panaroo_dir_falls_back_to_aligned_gene_sequences() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("ignored.fas"), "").unwrap();
+        let fallback = dir.path().join("aligned_gene_sequences");
+        fs::create_dir(&fallback).unwrap();
+        let gene = fallback.join("gene.aln.fas");
+        fs::write(&gene, "").unwrap();
+
+        let observed = read_panaroo_dir(dir.path()).unwrap();
+
+        assert_eq!(observed, vec![gene]);
+    }
+
+    #[test]
+    // Verifies Panaroo discovery errors when neither location contains alignments.
+    fn read_panaroo_dir_rejects_empty_locations() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("ignored.fas"), "").unwrap();
+
+        let error = read_panaroo_dir(dir.path()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("found no Panaroo alignment files ending in .aln.fas"),
+            "error: {error}"
+        );
     }
 
     #[test]

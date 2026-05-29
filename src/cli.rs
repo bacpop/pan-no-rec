@@ -1,12 +1,21 @@
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Find recombination from pangenome alignments")]
+#[command(group(
+    ArgGroup::new("input")
+        .required(true)
+        .multiple(false)
+        .args(["msa_list", "panaroo_dir"])
+))]
 pub(crate) struct Args {
     #[arg(long, value_name = "PATH")]
-    pub msa_list: PathBuf,
+    pub msa_list: Option<PathBuf>,
+
+    #[arg(long, value_name = "DIR")]
+    pub panaroo_dir: Option<PathBuf>,
 
     #[arg(long, default_value_t = 1, value_parser = parse_threads)]
     pub threads: usize,
