@@ -1,4 +1,4 @@
-use anyhow::{Error, anyhow};
+use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::ThreadPoolBuilder;
 
@@ -10,9 +10,6 @@ use crate::cli::cli_args;
 
 mod io;
 use io::{load_genes, read_msa_list, write_recombination_table};
-
-mod error;
-use error::CliError;
 
 mod dists;
 use dists::compare_loaded_alignments;
@@ -40,7 +37,7 @@ pub fn get_progress_bar(length: usize, percent: bool, quiet: bool) -> ProgressBa
 
 #[doc(hidden)]
 #[cfg(not(target_arch = "wasm32"))]
-pub fn main() -> Result<(), Error> {
+pub fn main() -> Result<()> {
     let args = cli_args();
     if args.quiet {
         simple_logger::init_with_level(log::Level::Error).unwrap();
@@ -51,13 +48,15 @@ pub fn main() -> Result<(), Error> {
         simple_logger::init_with_level(log::Level::Warn).unwrap();
     }
 
-    let mut print_success = true;
+    let print_success = true;
     ThreadPoolBuilder::new()
         .num_threads(args.threads)
         .build_global()
-        .map_err(|source| CliError::ThreadPoolBuild {
-            threads: args.threads,
-            source,
+        .with_context(|| {
+            format!(
+                "failed to initialize Rayon global thread pool with {} threads",
+                args.threads
+            )
         })?;
 
     let start = Instant::now();
@@ -66,9 +65,9 @@ pub fn main() -> Result<(), Error> {
     let aln_paths = read_msa_list(&args.msa_list)?;
     let (sample_names, genes) = load_genes(&aln_paths)?;
     if genes.is_empty() {
-        return Err(anyhow!("No valid genes loaded"));
+        bail!("No valid genes loaded");
     } else if sample_names.is_empty() {
-        return Err(anyhow!("Alignments are empty"));
+        bail!("Alignments are empty");
     } else {
         log::info!(
             "Read {} alignments and {} samples",
@@ -85,7 +84,7 @@ pub fn main() -> Result<(), Error> {
 
     log::info!("Writing output");
     write_recombination_table(&table, stdout().lock())
-        .map_err(|source| CliError::WriteStdout { source })?;
+        .with_context(|| "failed to write recombination table to stdout")?;
     let end = Instant::now();
 
     log::info!("Complete");

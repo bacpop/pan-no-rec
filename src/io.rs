@@ -1,11 +1,9 @@
-use crate::error::CompareError;
 use crate::gene::Gene;
 use crate::graph::RecombinationTable;
+use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use seq_io::fasta::{Reader, Record};
 use std::collections::HashSet;
-use std::error::Error;
-use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,40 +16,10 @@ struct RawAlignment {
     alignment_len: usize,
 }
 
-#[derive(Debug)]
-pub enum MsaListError {
-    Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-}
-
-impl fmt::Display for MsaListError {
-    // Formats MSA-list errors as user-facing messages.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MsaListError::Read { path, source } => {
-                write!(f, "failed to read MSA list '{}': {source}", path.display())
-            }
-        }
-    }
-}
-
-impl Error for MsaListError {
-    // Exposes wrapped I/O failures for standard error chaining.
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            MsaListError::Read { source, .. } => Some(source),
-        }
-    }
-}
-
 // Reads an MSA list file and resolves its entries to paths.
-pub fn read_msa_list(path: &Path) -> Result<Vec<PathBuf>, MsaListError> {
-    let contents = fs::read_to_string(path).map_err(|source| MsaListError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+pub fn read_msa_list(path: &Path) -> Result<Vec<PathBuf>> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read MSA list '{}'", path.display()))?;
     Ok(parse_msa_list(path, &contents))
 }
 
@@ -59,7 +27,7 @@ pub fn read_msa_list(path: &Path) -> Result<Vec<PathBuf>, MsaListError> {
 pub fn write_recombination_table<W: Write>(
     table: &RecombinationTable,
     mut writer: W,
-) -> Result<(), std::io::Error> {
+) -> Result<()> {
     write!(writer, "gene")?;
     for sample in &table.sample_names {
         write!(writer, "\t{sample}")?;
@@ -100,7 +68,7 @@ fn parse_msa_list(list_path: &Path, contents: &str) -> Vec<PathBuf> {
 }
 
 // Loads all input alignments into genes and sorted sample names.
-pub(crate) fn load_genes<P>(aln_paths: &[P]) -> Result<(Vec<String>, Vec<Gene>), CompareError>
+pub(crate) fn load_genes<P>(aln_paths: &[P]) -> Result<(Vec<String>, Vec<Gene>)>
 where
     P: AsRef<Path>,
 {
@@ -130,7 +98,7 @@ fn build_gene(raw: RawAlignment) -> Gene {
 }
 
 // Parses one FASTA alignment and validates its records.
-fn parse_raw_alignment(path: &Path) -> Result<RawAlignment, CompareError> {
+fn parse_raw_alignment(path: &Path) -> Result<RawAlignment> {
     let path = path.to_path_buf();
     let gene_name = gene_name_from_path(&path)?;
     let reader = open_alignment_reader(&path)?;
@@ -141,43 +109,47 @@ fn parse_raw_alignment(path: &Path) -> Result<RawAlignment, CompareError> {
     let mut alignment_len = None;
 
     while let Some(record) = reader.next() {
-        let record = record.map_err(|source| CompareError::FastaParse {
-            path: path.clone(),
-            source,
-        })?;
+        let record = record
+            .with_context(|| format!("failed to parse FASTA alignment '{}'", path.display()))?;
 
-        let sample =
-            normalize_sample_id(record.id().map_err(|source| CompareError::HeaderUtf8 {
-                path: path.clone(),
-                source,
-            })?);
+        let sample = normalize_sample_id(record.id().with_context(|| {
+            format!(
+                "sample header in alignment '{}' is not valid UTF-8",
+                path.display()
+            )
+        })?);
 
         if !seen_samples.insert(sample.clone()) {
-            return Err(CompareError::DuplicateSample { path, sample });
+            bail!(
+                "alignment '{}' contains duplicate sample header '{sample}'",
+                path.display()
+            );
         }
 
         let sequence = record.full_seq();
         let observed_len = sequence.len();
 
         if observed_len == 0 {
-            return Err(CompareError::EmptySequence { path, sample });
+            bail!(
+                "sample '{sample}' in alignment '{}' has a zero-length sequence",
+                path.display()
+            );
         }
 
         if observed_len > u32::MAX as usize {
-            return Err(CompareError::AlignmentTooLong {
-                path,
-                length: observed_len,
-            });
+            bail!(
+                "alignment '{}' has {observed_len} columns, exceeding the {} column limit",
+                path.display(),
+                u32::MAX
+            );
         }
 
         match alignment_len {
             Some(expected) if expected != observed_len => {
-                return Err(CompareError::VariableLength {
-                    path,
-                    sample,
-                    expected,
-                    observed: observed_len,
-                });
+                bail!(
+                    "alignment '{}' has variable sequence lengths: sample '{sample}' has length {observed_len}, expected {expected}",
+                    path.display()
+                );
             }
             Some(_) => {}
             None => alignment_len = Some(observed_len),
@@ -187,8 +159,9 @@ fn parse_raw_alignment(path: &Path) -> Result<RawAlignment, CompareError> {
         sequences.push(sequence.into_owned());
     }
 
-    let alignment_len =
-        alignment_len.ok_or_else(|| CompareError::EmptyAlignment { path: path.clone() })?;
+    let Some(alignment_len) = alignment_len else {
+        bail!("alignment '{}' contains no FASTA records", path.display());
+    };
 
     Ok(RawAlignment {
         gene_name,
@@ -207,11 +180,9 @@ fn normalize_sample_id(record_id: &str) -> String {
 }
 
 // Opens plain or gzip-compressed alignment input for reading.
-fn open_alignment_reader(path: &Path) -> Result<Box<dyn Read>, CompareError> {
-    let file = File::open(path).map_err(|source| CompareError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn open_alignment_reader(path: &Path) -> Result<Box<dyn Read>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to read alignment '{}'", path.display()))?;
 
     if has_extension(path, "gz") || has_extension(path, "bgz") {
         Ok(Box::new(MultiGzDecoder::new(file)))
@@ -221,13 +192,10 @@ fn open_alignment_reader(path: &Path) -> Result<Box<dyn Read>, CompareError> {
 }
 
 // Derives a gene name by stripping known alignment/compression suffixes.
-fn gene_name_from_path(path: &Path) -> Result<String, CompareError> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| CompareError::InvalidPath {
-            path: path.to_path_buf(),
-        })?;
+fn gene_name_from_path(path: &Path) -> Result<String> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        bail!("alignment path has no filename: '{}'", path.display());
+    };
 
     let mut name = file_name.to_owned();
 
@@ -240,9 +208,7 @@ fn gene_name_from_path(path: &Path) -> Result<String, CompareError> {
     }
 
     if name.is_empty() {
-        return Err(CompareError::InvalidPath {
-            path: path.to_path_buf(),
-        });
+        bail!("alignment path has no filename: '{}'", path.display());
     }
 
     Ok(name)
@@ -323,13 +289,12 @@ mod tests {
         );
 
         let error = parse_raw_alignment(&path).unwrap_err();
-
-        match error {
-            CompareError::DuplicateSample { sample, .. } => {
-                assert_eq!(sample, "sample1");
-            }
-            other => panic!("expected duplicate sample, got {other:?}"),
-        }
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate sample header 'sample1'"),
+            "error: {error}"
+        );
     }
 
     #[test]
@@ -339,7 +304,13 @@ mod tests {
         let path = write_alignment(&dir, "gene.aln", ">sample1\nACGT\n>sample2\nACG\n");
 
         let error = parse_raw_alignment(&path).unwrap_err();
-        assert!(matches!(error, CompareError::VariableLength { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("variable sequence lengths"),
+            "error: {message}"
+        );
+        assert!(message.contains("length 3"), "error: {message}");
+        assert!(message.contains("expected 4"), "error: {message}");
     }
 
     #[test]
