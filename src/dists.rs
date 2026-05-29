@@ -119,10 +119,9 @@ mod tests {
     where
         P: AsRef<Path>,
     {
-        let (sample_names, genes) =
-            load_genes(aln_paths, ParalogMode::First).expect("Test gene load failed");
-        let hits = compare_loaded_alignments(&sample_names, &genes, true);
-        (sample_names, genes, hits)
+        let loaded = load_genes(aln_paths, ParalogMode::First).expect("Test gene load failed");
+        let hits = compare_loaded_alignments(&loaded.sample_names, &loaded.genes, true);
+        (loaded.sample_names, loaded.genes, hits)
     }
 
     // Normalizes Rayon-collected hit order for tests that compare pair vectors.
@@ -237,10 +236,10 @@ mod tests {
         let gene_ab = write_alignment(&dir, "gene_ab.aln", ">alpha\nAAAA\n>beta\nCCCC\n");
         let gene_ag = write_alignment(&dir, "gene_ag.aln", ">alpha\nAAAA\n>gamma\nTTTT\n");
         let gene_bg = write_alignment(&dir, "gene_bg.aln", ">beta\nCCCC\n>gamma\nTTTT\n");
-        let (_sample_names, genes) =
+        let loaded =
             crate::io::load_genes(&[gene_ab, gene_ag, gene_bg], ParalogMode::First).unwrap();
 
-        let observed: Vec<_> = collect_comparable_pair_gene_stats(&genes, "alpha", "beta")
+        let observed: Vec<_> = collect_comparable_pair_gene_stats(&loaded.genes, "alpha", "beta")
             .into_iter()
             .map(|stats| stats.gene_id)
             .collect();

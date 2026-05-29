@@ -10,11 +10,25 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
+pub(crate) struct LoadedAlignments {
+    pub(crate) sample_names: Vec<String>,
+    pub(crate) genes: Vec<Gene>,
+    pub(crate) paralogs: Vec<ParalogReportRow>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ParalogReportRow {
+    pub(crate) gene: String,
+    pub(crate) paralog_samples: usize,
+}
+
+#[derive(Debug)]
 struct RawAlignment {
     gene_name: String,
     sample_names: Vec<String>,
     sequences: Vec<Vec<u8>>,
     alignment_len: usize,
+    paralog_sample_count: usize,
 }
 
 #[derive(Debug)]
@@ -127,6 +141,21 @@ pub fn write_recombination_table<W: Write>(
     Ok(())
 }
 
+// Writes per-gene paralog metadata as tab-separated text.
+pub(crate) fn write_paralog_report(path: &Path, rows: &[ParalogReportRow]) -> Result<()> {
+    let mut writer = File::create(path)
+        .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
+
+    writeln!(writer, "gene\tparalog_samples")
+        .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
+    for row in rows {
+        writeln!(writer, "{}\t{}", row.gene, row.paralog_samples)
+            .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
+    }
+
+    Ok(())
+}
+
 // Parses list-file contents, ignoring blanks and comments.
 fn parse_msa_list(list_path: &Path, contents: &str) -> Vec<PathBuf> {
     let base_dir = list_path
@@ -150,18 +179,22 @@ fn parse_msa_list(list_path: &Path, contents: &str) -> Vec<PathBuf> {
 }
 
 // Loads all input alignments into genes and sorted sample names.
-pub(crate) fn load_genes<P>(
-    aln_paths: &[P],
-    paralog_mode: ParalogMode,
-) -> Result<(Vec<String>, Vec<Gene>)>
+pub(crate) fn load_genes<P>(aln_paths: &[P], paralog_mode: ParalogMode) -> Result<LoadedAlignments>
 where
     P: AsRef<Path>,
 {
     let mut genes = Vec::with_capacity(aln_paths.len());
+    let mut paralogs = Vec::new();
     let mut all_samples = HashSet::new();
 
     for aln_path in aln_paths {
         let raw = parse_raw_alignment(aln_path.as_ref(), paralog_mode)?;
+        if raw.paralog_sample_count > 0 {
+            paralogs.push(ParalogReportRow {
+                gene: raw.gene_name.clone(),
+                paralog_samples: raw.paralog_sample_count,
+            });
+        }
         all_samples.extend(raw.sample_names.iter().cloned());
         genes.push(build_gene(raw));
     }
@@ -169,7 +202,11 @@ where
     let mut sample_names: Vec<_> = all_samples.into_iter().collect();
     sample_names.sort();
 
-    Ok((sample_names, genes))
+    Ok(LoadedAlignments {
+        sample_names,
+        genes,
+        paralogs,
+    })
 }
 
 // Converts a parsed raw alignment into the compact gene representation.
@@ -263,20 +300,12 @@ fn parse_raw_alignment(path: &Path, paralog_mode: ParalogMode) -> Result<RawAlig
         .count();
     let (sample_names, sequences) = resolve_paralogs(sample_groups, paralog_mode);
 
-    if affected_sample_count > 0 {
-        log::warn!(
-            "alignment '{}' contains paralogs for {} samples; using paralog mode '{}'",
-            gene_name,
-            affected_sample_count,
-            paralog_mode
-        );
-    }
-
     Ok(RawAlignment {
         gene_name,
         sample_names,
         sequences,
         alignment_len,
+        paralog_sample_count: affected_sample_count,
     })
 }
 
@@ -424,6 +453,7 @@ mod tests {
         let raw = parse_default(&path).unwrap();
         assert_eq!(raw.gene_name, "gene");
         assert_eq!(raw.alignment_len, 4);
+        assert_eq!(raw.paralog_sample_count, 0);
         assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
         assert_eq!(raw.sequences.len(), 2);
     }
@@ -466,6 +496,7 @@ mod tests {
 
         let raw = parse_default(&path).unwrap();
 
+        assert_eq!(raw.paralog_sample_count, 1);
         assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
         assert_eq!(raw.sequences, vec![b"ACGT".to_vec(), b"CCCC".to_vec()]);
     }
@@ -482,6 +513,7 @@ mod tests {
 
         let raw = parse_raw_alignment(&path, ParalogMode::Skip).unwrap();
 
+        assert_eq!(raw.paralog_sample_count, 1);
         assert_eq!(raw.sample_names, vec!["sample2", "sample3"]);
         assert_eq!(raw.sequences, vec![b"CCCC".to_vec(), b"GGGG".to_vec()]);
     }
@@ -498,6 +530,7 @@ mod tests {
 
         let raw = parse_raw_alignment(&path, ParalogMode::Longest).unwrap();
 
+        assert_eq!(raw.paralog_sample_count, 1);
         assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
         assert_eq!(raw.sequences, vec![b"A-CG".to_vec(), b"CCCC".to_vec()]);
     }
@@ -558,16 +591,16 @@ mod tests {
         let gene_a = write_alignment(&dir, "gene_a.aln", ">s1\nAAAA\n>s2\nCCCC\n");
         let gene_b = write_alignment(&dir, "gene_b.aln", ">s2\nCCCC\n>s1\nAAAA\n");
 
-        let (sample_names, genes) = load_genes(&[gene_a, gene_b], ParalogMode::First).unwrap();
+        let loaded = load_genes(&[gene_a, gene_b], ParalogMode::First).unwrap();
 
-        assert_eq!(sample_names, vec!["s1", "s2"]);
-        assert_eq!(genes.len(), 2);
-        assert_eq!(genes[0].sample_index("s1"), Some(0));
-        assert_eq!(genes[0].sample_index("s2"), Some(1));
-        assert_eq!(genes[1].sample_index("s2"), Some(0));
-        assert_eq!(genes[1].sample_index("s1"), Some(1));
-        assert_eq!(genes[0].snp_count(0, 1), 4);
-        assert_eq!(genes[1].snp_count(0, 1), 4);
+        assert_eq!(loaded.sample_names, vec!["s1", "s2"]);
+        assert_eq!(loaded.genes.len(), 2);
+        assert_eq!(loaded.genes[0].sample_index("s1"), Some(0));
+        assert_eq!(loaded.genes[0].sample_index("s2"), Some(1));
+        assert_eq!(loaded.genes[1].sample_index("s2"), Some(0));
+        assert_eq!(loaded.genes[1].sample_index("s1"), Some(1));
+        assert_eq!(loaded.genes[0].snp_count(0, 1), 4);
+        assert_eq!(loaded.genes[1].snp_count(0, 1), 4);
     }
 
     #[test]
@@ -585,14 +618,52 @@ mod tests {
             ">s3;contig_b\nCCCC\n>s1;contig_b\nAAAA\n",
         );
 
-        let (sample_names, genes) = load_genes(&[gene_a, gene_b], ParalogMode::First).unwrap();
+        let loaded = load_genes(&[gene_a, gene_b], ParalogMode::First).unwrap();
 
-        assert_eq!(sample_names, vec!["s1", "s2", "s3"]);
-        assert_eq!(genes.len(), 2);
-        assert_eq!(genes[0].sample_index("s1"), Some(0));
-        assert_eq!(genes[0].sample_index("s2"), Some(1));
-        assert_eq!(genes[1].sample_index("s3"), Some(0));
-        assert_eq!(genes[1].sample_index("s1"), Some(1));
+        assert_eq!(loaded.sample_names, vec!["s1", "s2", "s3"]);
+        assert_eq!(loaded.genes.len(), 2);
+        assert_eq!(loaded.genes[0].sample_index("s1"), Some(0));
+        assert_eq!(loaded.genes[0].sample_index("s2"), Some(1));
+        assert_eq!(loaded.genes[1].sample_index("s3"), Some(0));
+        assert_eq!(loaded.genes[1].sample_index("s1"), Some(1));
+    }
+
+    #[test]
+    // Verifies load metadata records affected genes in input order.
+    fn load_genes_collects_paralog_report_rows_in_input_order() {
+        let dir = TempDir::new().unwrap();
+        let gene_a = write_alignment(
+            &dir,
+            "gene_a.aln",
+            ">s1;first\nAAAA\n>s2\nCCCC\n>s1;second\nTTTT\n",
+        );
+        let gene_clean = write_alignment(&dir, "gene_clean.aln", ">s1\nAAAA\n>s2\nCCCC\n");
+        let gene_b = write_alignment(
+            &dir,
+            "gene_b.aln",
+            concat!(
+                ">s1;first\nAAAA\n",
+                ">s2;first\nCCCC\n",
+                ">s1;second\nTTTT\n",
+                ">s2;second\nGGGG\n",
+            ),
+        );
+
+        let loaded = load_genes(&[gene_a, gene_clean, gene_b], ParalogMode::First).unwrap();
+
+        assert_eq!(
+            loaded.paralogs,
+            vec![
+                ParalogReportRow {
+                    gene: "gene_a".to_string(),
+                    paralog_samples: 1,
+                },
+                ParalogReportRow {
+                    gene: "gene_b".to_string(),
+                    paralog_samples: 2,
+                },
+            ]
+        );
     }
 
     #[test]

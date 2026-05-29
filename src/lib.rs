@@ -9,7 +9,9 @@ mod cli;
 use crate::cli::cli_args;
 
 mod io;
-use io::{load_genes, read_msa_list, read_panaroo_dir, write_recombination_table};
+use io::{
+    load_genes, read_msa_list, read_panaroo_dir, write_paralog_report, write_recombination_table,
+};
 
 mod dists;
 use dists::compare_loaded_alignments;
@@ -67,7 +69,19 @@ pub fn main() -> Result<()> {
         (None, Some(path)) => read_panaroo_dir(path)?,
         _ => unreachable!("clap requires exactly one input source"),
     };
-    let (sample_names, genes) = load_genes(&aln_paths, args.paralog_mode)?;
+    let loaded = load_genes(&aln_paths, args.paralog_mode)?;
+    if !loaded.paralogs.is_empty() {
+        write_paralog_report(&args.paralog_report, &loaded.paralogs)?;
+        log::warn!(
+            "{} alignments contained paralogs; wrote paralog report to '{}'; using paralog mode '{}'",
+            loaded.paralogs.len(),
+            args.paralog_report.display(),
+            args.paralog_mode
+        );
+    }
+
+    let sample_names = loaded.sample_names;
+    let genes = loaded.genes;
     if genes.is_empty() {
         bail!("No valid genes loaded");
     } else if sample_names.is_empty() {

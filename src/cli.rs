@@ -48,6 +48,9 @@ pub(crate) struct Args {
     #[arg(long, value_enum, default_value_t = ParalogMode::First)]
     pub paralog_mode: ParalogMode,
 
+    #[arg(long, value_name = "PATH", default_value = "paralogs.txt")]
+    pub paralog_report: PathBuf,
+
     /// Show progress messages
     #[arg(short, long, global = true)]
     pub verbose: bool,
