@@ -183,15 +183,26 @@ fn cli_rejects_invalid_paralog_mode() {
 }
 
 #[test]
-// Verifies duplicate-containing alignments emit one warning with mode details.
-fn cli_warns_once_for_alignment_with_paralogs() {
+// Verifies duplicate-containing alignments emit one summary warning and report.
+fn cli_summarizes_paralog_warnings_and_writes_default_report() {
     let dir = TempDir::new().unwrap();
     write_alignment(
         &dir,
-        "gene_dup.aln",
+        "gene_dup_a.aln",
         ">alpha;first\nAAAA\n>beta\nAAAA\n>alpha;second\nCCCC\n",
     );
-    let list_path = write_msa_list(&dir, "gene_dup.aln\n");
+    write_alignment(&dir, "gene_clean.aln", ">alpha\nAAAA\n>beta\nAAAA\n");
+    write_alignment(
+        &dir,
+        "gene_dup_b.aln",
+        concat!(
+            ">alpha;first\nAAAA\n",
+            ">beta;first\nAAAA\n",
+            ">alpha;second\nCCCC\n",
+            ">beta;second\nCCCC\n",
+        ),
+    );
+    let list_path = write_msa_list(&dir, "gene_dup_a.aln\ngene_clean.aln\ngene_dup_b.aln\n");
 
     let output = run_cli_with_paralog_mode(&list_path, "first");
 
@@ -201,12 +212,117 @@ fn cli_warns_once_for_alignment_with_paralogs() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr.matches("contains paralogs").count(), 1);
+    assert_eq!(stderr.matches("contained paralogs").count(), 1);
     assert!(
-        stderr.contains(
-            "alignment 'gene_dup' contains paralogs for 1 samples; using paralog mode 'first'"
-        ),
+        stderr.contains("2 alignments contained paralogs; wrote paralog report to 'paralogs.txt'; using paralog mode 'first'"),
         "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("alignment 'gene_dup_a' contains paralogs"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("paralogs.txt")).unwrap(),
+        "gene\tparalog_samples\ngene_dup_a\t1\ngene_dup_b\t2\n"
+    );
+}
+
+#[test]
+// Verifies --paralog-report selects the report path.
+fn cli_writes_custom_paralog_report_path() {
+    let dir = TempDir::new().unwrap();
+    write_alignment(
+        &dir,
+        "gene_dup.aln",
+        ">alpha;first\nAAAA\n>beta\nAAAA\n>alpha;second\nCCCC\n",
+    );
+    let list_path = write_msa_list(&dir, "gene_dup.aln\n");
+    let report_path = dir.path().join("custom-paralogs.tsv");
+
+    let output = msa_command(&list_path)
+        .arg("--threads")
+        .arg("1")
+        .arg("--paralog-mode")
+        .arg("first")
+        .arg("--paralog-report")
+        .arg(&report_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(report_path).unwrap(),
+        "gene\tparalog_samples\ngene_dup\t1\n"
+    );
+}
+
+#[test]
+// Verifies no report is created when no paralogs are present.
+fn cli_no_paralogs_does_not_create_report() {
+    let dir = TempDir::new().unwrap();
+    write_alignment(&dir, "gene_clean.aln", ">alpha\nAAAA\n>beta\nAAAA\n");
+    let list_path = write_msa_list(&dir, "gene_clean.aln\n");
+    let report_path = dir.path().join("no-paralogs.tsv");
+
+    let output = msa_command(&list_path)
+        .arg("--threads")
+        .arg("1")
+        .arg("--paralog-report")
+        .arg(&report_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!report_path.exists());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("contained paralogs"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+// Verifies --quiet suppresses the summary warning but still writes the report.
+fn cli_quiet_suppresses_paralog_warning_but_writes_report() {
+    let dir = TempDir::new().unwrap();
+    write_alignment(
+        &dir,
+        "gene_dup.aln",
+        ">alpha;first\nAAAA\n>beta\nAAAA\n>alpha;second\nCCCC\n",
+    );
+    let list_path = write_msa_list(&dir, "gene_dup.aln\n");
+    let report_path = dir.path().join("quiet-paralogs.tsv");
+
+    let output = msa_command(&list_path)
+        .arg("--threads")
+        .arg("1")
+        .arg("--quiet")
+        .arg("--paralog-report")
+        .arg(&report_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("contained paralogs"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(report_path).unwrap(),
+        "gene\tparalog_samples\ngene_dup\t1\n"
     );
 }
 
@@ -276,9 +392,7 @@ fn cli_rejects_zero_threads() {
 
 // Runs the binary with one MSA list and thread count.
 fn run_cli(list_path: &Path, threads: &str) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_pan-no-rec"))
-        .arg("--msa-list")
-        .arg(list_path)
+    let output = msa_command(list_path)
         .arg("--threads")
         .arg(threads)
         .output()
@@ -295,15 +409,21 @@ fn run_cli(list_path: &Path, threads: &str) -> String {
 
 // Runs the binary with one MSA list and selected paralog mode.
 fn run_cli_with_paralog_mode(list_path: &Path, mode: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_pan-no-rec"))
-        .arg("--msa-list")
-        .arg(list_path)
+    msa_command(list_path)
         .arg("--threads")
         .arg("1")
         .arg("--paralog-mode")
         .arg(mode)
         .output()
         .unwrap()
+}
+
+// Creates a command for an MSA-list run in the list directory.
+fn msa_command(list_path: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pan-no-rec"));
+    command.current_dir(list_path.parent().unwrap());
+    command.arg("--msa-list").arg(list_path);
+    command
 }
 
 // Returns stdout for successful command output.

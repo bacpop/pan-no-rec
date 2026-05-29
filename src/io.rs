@@ -1,8 +1,11 @@
 use crate::cli::ParalogMode;
 use crate::gene::Gene;
+use crate::get_progress_bar;
 use crate::graph::RecombinationTable;
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
+use indicatif::ParallelProgressIterator;
+use rayon::prelude::*;
 use seq_io::fasta::{Reader, Record};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fs::{self, File};
@@ -29,6 +32,13 @@ struct RawAlignment {
     sequences: Vec<Vec<u8>>,
     alignment_len: usize,
     paralog_sample_count: usize,
+}
+
+#[derive(Debug)]
+struct ProcessedAlignment {
+    gene: Gene,
+    sample_names: Vec<String>,
+    paralog: Option<ParalogReportRow>,
 }
 
 #[derive(Debug)]
@@ -179,24 +189,45 @@ fn parse_msa_list(list_path: &Path, contents: &str) -> Vec<PathBuf> {
 }
 
 // Loads all input alignments into genes and sorted sample names.
-pub(crate) fn load_genes<P>(aln_paths: &[P], paralog_mode: ParalogMode) -> Result<LoadedAlignments>
+pub(crate) fn load_genes<P>(
+    aln_paths: &[P],
+    paralog_mode: ParalogMode,
+    quiet: bool,
+) -> Result<LoadedAlignments>
 where
-    P: AsRef<Path>,
+    P: AsRef<Path> + Sync,
 {
     let mut genes = Vec::with_capacity(aln_paths.len());
     let mut paralogs = Vec::new();
     let mut all_samples = HashSet::new();
 
-    for aln_path in aln_paths {
-        let raw = parse_raw_alignment(aln_path.as_ref(), paralog_mode)?;
-        if raw.paralog_sample_count > 0 {
-            paralogs.push(ParalogReportRow {
+    let pbar = get_progress_bar(aln_paths.len(), false, quiet);
+    let processed_alignments: Vec<ProcessedAlignment> = aln_paths
+        .par_iter()
+        .progress_with(pbar)
+        .map(|aln| {
+            let raw = parse_raw_alignment(aln.as_ref(), paralog_mode)?;
+            let paralog = (raw.paralog_sample_count > 0).then(|| ParalogReportRow {
                 gene: raw.gene_name.clone(),
                 paralog_samples: raw.paralog_sample_count,
             });
+            let sample_names = raw.sample_names.clone();
+            let gene = build_gene(raw);
+
+            Ok(ProcessedAlignment {
+                gene,
+                sample_names,
+                paralog,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for processed in processed_alignments {
+        all_samples.extend(processed.sample_names);
+        if let Some(paralog) = processed.paralog {
+            paralogs.push(paralog);
         }
-        all_samples.extend(raw.sample_names.iter().cloned());
-        genes.push(build_gene(raw));
+        genes.push(processed.gene);
     }
 
     let mut sample_names: Vec<_> = all_samples.into_iter().collect();
@@ -591,7 +622,7 @@ mod tests {
         let gene_a = write_alignment(&dir, "gene_a.aln", ">s1\nAAAA\n>s2\nCCCC\n");
         let gene_b = write_alignment(&dir, "gene_b.aln", ">s2\nCCCC\n>s1\nAAAA\n");
 
-        let loaded = load_genes(&[gene_a, gene_b], ParalogMode::First).unwrap();
+        let loaded = load_genes(&[gene_a, gene_b], ParalogMode::First, true).unwrap();
 
         assert_eq!(loaded.sample_names, vec!["s1", "s2"]);
         assert_eq!(loaded.genes.len(), 2);
@@ -618,7 +649,7 @@ mod tests {
             ">s3;contig_b\nCCCC\n>s1;contig_b\nAAAA\n",
         );
 
-        let loaded = load_genes(&[gene_a, gene_b], ParalogMode::First).unwrap();
+        let loaded = load_genes(&[gene_a, gene_b], ParalogMode::First, true).unwrap();
 
         assert_eq!(loaded.sample_names, vec!["s1", "s2", "s3"]);
         assert_eq!(loaded.genes.len(), 2);
@@ -649,7 +680,7 @@ mod tests {
             ),
         );
 
-        let loaded = load_genes(&[gene_a, gene_clean, gene_b], ParalogMode::First).unwrap();
+        let loaded = load_genes(&[gene_a, gene_clean, gene_b], ParalogMode::First, true).unwrap();
 
         assert_eq!(
             loaded.paralogs,

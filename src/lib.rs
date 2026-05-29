@@ -63,13 +63,13 @@ pub fn main() -> Result<()> {
 
     let start = Instant::now();
 
-    log::info!("Getting input files");
+    log::info!("Reading input files");
     let aln_paths = match (&args.msa_list, &args.panaroo_dir) {
         (Some(path), None) => read_msa_list(path)?,
         (None, Some(path)) => read_panaroo_dir(path)?,
         _ => unreachable!("clap requires exactly one input source"),
     };
-    let loaded = load_genes(&aln_paths, args.paralog_mode)?;
+    let loaded = load_genes(&aln_paths, args.paralog_mode, args.quiet)?;
     if !loaded.paralogs.is_empty() {
         write_paralog_report(&args.paralog_report, &loaded.paralogs)?;
         log::warn!(

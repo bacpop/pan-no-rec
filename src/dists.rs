@@ -117,9 +117,10 @@ mod tests {
 
     fn compare_alignments<P>(aln_paths: &[P]) -> (Vec<String>, Vec<Gene>, PairHits)
     where
-        P: AsRef<Path>,
+        P: AsRef<Path> + Sync,
     {
-        let loaded = load_genes(aln_paths, ParalogMode::First).expect("Test gene load failed");
+        let loaded =
+            load_genes(aln_paths, ParalogMode::First, true).expect("Test gene load failed");
         let hits = compare_loaded_alignments(&loaded.sample_names, &loaded.genes, true);
         (loaded.sample_names, loaded.genes, hits)
     }
@@ -133,7 +134,7 @@ mod tests {
 
     fn infer_recombination_presence<P>(aln_paths: &[P]) -> RecombinationTable
     where
-        P: AsRef<Path>,
+        P: AsRef<Path> + Sync,
     {
         let (sample_names, genes, hits) = compare_alignments(aln_paths);
         presence_table_from_pair_hits(&sample_names, &genes, &hits, true)
@@ -237,7 +238,7 @@ mod tests {
         let gene_ag = write_alignment(&dir, "gene_ag.aln", ">alpha\nAAAA\n>gamma\nTTTT\n");
         let gene_bg = write_alignment(&dir, "gene_bg.aln", ">beta\nCCCC\n>gamma\nTTTT\n");
         let loaded =
-            crate::io::load_genes(&[gene_ab, gene_ag, gene_bg], ParalogMode::First).unwrap();
+            crate::io::load_genes(&[gene_ab, gene_ag, gene_bg], ParalogMode::First, true).unwrap();
 
         let observed: Vec<_> = collect_comparable_pair_gene_stats(&loaded.genes, "alpha", "beta")
             .into_iter()
