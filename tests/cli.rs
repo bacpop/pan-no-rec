@@ -2,11 +2,13 @@ use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
+// Writes a FASTA alignment fixture into the temporary directory.
 fn write_alignment(dir: &TempDir, name: &str, contents: &str) {
     fs::write(dir.path().join(name), contents).unwrap();
 }
 
 #[test]
+// Verifies CLI TSV output is stable across thread counts.
 fn cli_prints_presence_absence_tsv_stably_across_thread_counts() {
     let dir = TempDir::new().unwrap();
     write_alignment(
@@ -44,6 +46,26 @@ fn cli_prints_presence_absence_tsv_stably_across_thread_counts() {
     assert_eq!(two_threads, expected);
 }
 
+#[test]
+// Verifies clap rejects invalid thread counts before inference starts.
+fn cli_rejects_zero_threads() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pangenome_recombination"))
+        .arg("--msa-list")
+        .arg("unused.txt")
+        .arg("--threads")
+        .arg("0")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("thread count must be at least 1"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// Runs the binary with one MSA list and thread count.
 fn run_cli(list_path: &std::path::Path, threads: &str) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_pangenome_recombination"))
         .arg("--msa-list")

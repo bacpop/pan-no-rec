@@ -27,6 +27,7 @@ pub enum MsaListError {
 }
 
 impl fmt::Display for MsaListError {
+    // Formats MSA-list errors as user-facing messages.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MsaListError::Read { path, source } => {
@@ -37,6 +38,7 @@ impl fmt::Display for MsaListError {
 }
 
 impl Error for MsaListError {
+    // Exposes wrapped I/O failures for standard error chaining.
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             MsaListError::Read { source, .. } => Some(source),
@@ -44,6 +46,7 @@ impl Error for MsaListError {
     }
 }
 
+// Reads an MSA list file and resolves its entries to paths.
 pub fn read_msa_list(path: &Path) -> Result<Vec<PathBuf>, MsaListError> {
     let contents = fs::read_to_string(path).map_err(|source| MsaListError::Read {
         path: path.to_path_buf(),
@@ -52,6 +55,7 @@ pub fn read_msa_list(path: &Path) -> Result<Vec<PathBuf>, MsaListError> {
     Ok(parse_msa_list(path, &contents))
 }
 
+// Writes a recombination presence table as tab-separated text.
 pub fn write_recombination_table<W: Write>(
     table: &RecombinationTable,
     mut writer: W,
@@ -73,6 +77,7 @@ pub fn write_recombination_table<W: Write>(
     Ok(())
 }
 
+// Parses list-file contents, ignoring blanks and comments.
 fn parse_msa_list(list_path: &Path, contents: &str) -> Vec<PathBuf> {
     let base_dir = list_path
         .parent()
@@ -94,6 +99,7 @@ fn parse_msa_list(list_path: &Path, contents: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+// Loads all input alignments into genes and sorted sample names.
 pub(crate) fn load_genes<P>(aln_paths: &[P]) -> Result<(Vec<String>, Vec<Gene>), CompareError>
 where
     P: AsRef<Path>,
@@ -113,6 +119,7 @@ where
     Ok((sample_names, genes))
 }
 
+// Converts a parsed raw alignment into the compact gene representation.
 fn build_gene(raw: RawAlignment) -> Gene {
     Gene::new(
         raw.gene_name,
@@ -122,6 +129,7 @@ fn build_gene(raw: RawAlignment) -> Gene {
     )
 }
 
+// Parses one FASTA alignment and validates its records.
 fn parse_raw_alignment(path: &Path) -> Result<RawAlignment, CompareError> {
     let path = path.to_path_buf();
     let gene_name = gene_name_from_path(&path)?;
@@ -190,6 +198,7 @@ fn parse_raw_alignment(path: &Path) -> Result<RawAlignment, CompareError> {
     })
 }
 
+// Normalizes a FASTA record identifier to its sample name.
 fn normalize_sample_id(record_id: &str) -> String {
     record_id
         .split_once(';')
@@ -197,6 +206,7 @@ fn normalize_sample_id(record_id: &str) -> String {
         .to_owned()
 }
 
+// Opens plain or gzip-compressed alignment input for reading.
 fn open_alignment_reader(path: &Path) -> Result<Box<dyn Read>, CompareError> {
     let file = File::open(path).map_err(|source| CompareError::Io {
         path: path.to_path_buf(),
@@ -210,6 +220,7 @@ fn open_alignment_reader(path: &Path) -> Result<Box<dyn Read>, CompareError> {
     }
 }
 
+// Derives a gene name by stripping known alignment/compression suffixes.
 fn gene_name_from_path(path: &Path) -> Result<String, CompareError> {
     let file_name = path
         .file_name()
@@ -237,12 +248,14 @@ fn gene_name_from_path(path: &Path) -> Result<String, CompareError> {
     Ok(name)
 }
 
+// Checks a path extension without case sensitivity.
 fn has_extension(path: &Path, extension: &str) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
 }
 
+// Strips a matching suffix from a mutable file-name string.
 fn strip_extension(name: &mut String, extension: &str) {
     let suffix = format!(".{extension}");
     if name
@@ -260,6 +273,7 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    // Writes a temporary alignment file and returns its path.
     fn write_alignment(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
         let path = dir.path().join(name);
         fs::write(&path, contents).unwrap();
@@ -267,6 +281,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies valid equal-length FASTA records are accepted.
     fn parser_accepts_valid_equal_length_fasta() {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(
@@ -283,6 +298,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies sample IDs are truncated at the first semicolon.
     fn parser_normalizes_sample_ids_before_first_semicolon() {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(
@@ -297,6 +313,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies duplicate normalized sample IDs are rejected.
     fn parser_rejects_duplicate_normalized_sample_ids() {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(
@@ -316,6 +333,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies records with inconsistent sequence lengths are rejected.
     fn parser_rejects_variable_sequence_lengths() {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(&dir, "gene.aln", ">sample1\nACGT\n>sample2\nACG\n");
@@ -325,6 +343,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies per-gene sample order is preserved independently.
     fn sample_order_can_differ_between_genes() {
         let dir = TempDir::new().unwrap();
         let gene_a = write_alignment(&dir, "gene_a.aln", ">s1\nAAAA\n>s2\nCCCC\n");
@@ -343,6 +362,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies genes may contain different subsets of samples.
     fn genes_may_have_different_sample_sets() {
         let dir = TempDir::new().unwrap();
         let gene_a = write_alignment(
@@ -367,6 +387,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies MSA lists ignore comments and blank lines.
     fn parse_msa_list_ignores_blank_lines_and_comments() {
         let observed = parse_msa_list(
             Path::new("fixtures/list.txt"),
@@ -383,6 +404,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies relative MSA entries are resolved against the list directory.
     fn parse_msa_list_resolves_relative_paths_against_list_directory() {
         let observed = parse_msa_list(
             Path::new("data/lists/msa.txt"),
@@ -399,6 +421,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies absolute MSA entries are preserved unchanged.
     fn parse_msa_list_preserves_absolute_paths() {
         let absolute = std::env::current_dir().unwrap().join("gene.aln");
         let observed = parse_msa_list(Path::new("data/list.txt"), &absolute.to_string_lossy());
@@ -407,6 +430,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies recombination tables are emitted as expected TSV.
     fn write_recombination_table_emits_tsv() {
         let table = RecombinationTable {
             sample_names: vec!["alpha".to_string(), "beta".to_string()],

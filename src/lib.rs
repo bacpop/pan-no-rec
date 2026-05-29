@@ -7,7 +7,6 @@ mod model;
 use crate::gene::Gene;
 use crate::io::load_genes;
 use crate::model::{PairGeneStats, select_recombinant_gene_indices};
-use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
@@ -29,40 +28,36 @@ pub struct RecombinationRow {
     pub presence: Vec<u8>,
 }
 
-pub fn compare_alignments<P>(aln_paths: &[P], threads: usize) -> Result<PairHits, CompareError>
+// Compares alignments and returns recombinant sample pairs per gene.
+pub fn compare_alignments<P>(aln_paths: &[P]) -> Result<PairHits, CompareError>
 where
     P: AsRef<Path>,
 {
-    validate_threads(threads)?;
-
     let (sample_names, genes) = load_genes(aln_paths)?;
 
     if genes.is_empty() {
         return Ok(HashMap::new());
     }
 
-    run_with_thread_pool(threads, || compare_loaded_alignments(&sample_names, &genes))
+    Ok(compare_loaded_alignments(&sample_names, &genes))
 }
 
-pub fn infer_recombination_presence<P>(
-    aln_paths: &[P],
-    threads: usize,
-) -> Result<RecombinationTable, CompareError>
+// Infers a gene-by-sample recombination presence table from alignments.
+pub fn infer_recombination_presence<P>(aln_paths: &[P]) -> Result<RecombinationTable, CompareError>
 where
     P: AsRef<Path>,
 {
-    validate_threads(threads)?;
-
     let (sample_names, genes) = load_genes(aln_paths)?;
     let hits = if genes.is_empty() {
         HashMap::new()
     } else {
-        run_with_thread_pool(threads, || compare_loaded_alignments(&sample_names, &genes))?
+        compare_loaded_alignments(&sample_names, &genes)
     };
 
     Ok(presence_table_from_pair_hits(&sample_names, &genes, &hits))
 }
 
+// Runs pairwise comparison across all sample pairs for loaded genes.
 fn compare_loaded_alignments(sample_names: &[String], genes: &[Gene]) -> PairHits {
     let sample_pair_count = sample_pair_count(sample_names.len());
     // Flatten the upper triangle of the sample-by-sample matrix into one Rayon
@@ -89,6 +84,7 @@ fn compare_loaded_alignments(sample_names: &[String], genes: &[Gene]) -> PairHit
     hits
 }
 
+// Builds the public presence table from pairwise recombinant hits.
 fn presence_table_from_pair_hits(
     sample_names: &[String],
     genes: &[Gene],
@@ -100,7 +96,7 @@ fn presence_table_from_pair_hits(
         .map(|(index, name)| (name.as_str(), index))
         .collect();
     let rows = genes
-        .iter()
+        .par_iter()
         .map(|gene| {
             let pairs = hits.get(gene.name()).map(Vec::as_slice).unwrap_or(&[]);
 
@@ -121,31 +117,12 @@ fn presence_table_from_pair_hits(
     }
 }
 
-fn validate_threads(threads: usize) -> Result<(), CompareError> {
-    if threads == 0 {
-        return Err(CompareError::InvalidThreadCount { threads });
-    }
-
-    Ok(())
-}
-
-fn run_with_thread_pool<T, F>(threads: usize, work: F) -> Result<T, CompareError>
-where
-    T: Send,
-    F: FnOnce() -> T + Send,
-{
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .map_err(|source| CompareError::ThreadPoolBuild { threads, source })?;
-
-    Ok(pool.install(work))
-}
-
+// Counts unique unordered sample pairs.
 fn sample_pair_count(sample_count: usize) -> usize {
     sample_count * sample_count.saturating_sub(1) / 2
 }
 
+// Maps a flat upper-triangle offset to the corresponding sample indices.
 fn sample_pair_indices(sample_count: usize, pair_offset: usize) -> (usize, usize) {
     debug_assert!(sample_count >= 2);
     debug_assert!(pair_offset < sample_pair_count(sample_count));
@@ -169,12 +146,14 @@ fn sample_pair_indices(sample_count: usize, pair_offset: usize) -> (usize, usize
     (sample_a, sample_b)
 }
 
+// Counts pair offsets before a sample's row in the upper triangle.
 fn pairs_before_sample(sample_count: usize, sample_index: usize) -> usize {
     // Number of upper-triangle pairs in rows before sample_index:
     // (sample_count - 1) + (sample_count - 2) + ... + (sample_count - sample_index).
     sample_index * (2 * sample_count - sample_index - 1) / 2
 }
 
+// Selects recombinant genes for one sample pair and tags them with that pair.
 fn selected_pair_hits(genes: &[Gene], sample_a: &str, sample_b: &str) -> Vec<(String, SamplePair)> {
     let pair_genes = collect_comparable_pair_gene_stats(genes, sample_a, sample_b);
     let recombinant_gene_indices = select_recombinant_gene_indices(pair_genes);
@@ -186,6 +165,7 @@ fn selected_pair_hits(genes: &[Gene], sample_a: &str, sample_b: &str) -> Vec<(St
         .collect()
 }
 
+// Collects SNP and length statistics for genes containing both samples.
 fn collect_comparable_pair_gene_stats<'a>(
     genes: &'a [Gene],
     sample_a: &str,
@@ -215,6 +195,7 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    // Writes a temporary FASTA alignment for tests.
     fn write_alignment(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
         let path = dir.path().join(name);
         fs::write(&path, contents).unwrap();
@@ -222,6 +203,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies flat pair offsets follow sample-pair lexicographic order.
     fn sample_pair_offsets_iterate_global_pairs_in_lexicographic_order() {
         let observed: Vec<_> = (0..sample_pair_count(4))
             .map(|offset| sample_pair_indices(4, offset))
@@ -234,6 +216,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies thresholding returns the expected high-divergence gene hits.
     fn bayesian_threshold_returns_expected_gene_keys_and_pairs() {
         let dir = TempDir::new().unwrap();
         let mut paths = Vec::new();
@@ -248,7 +231,7 @@ mod tests {
             ));
         }
 
-        let hits = compare_alignments(&paths, 1).unwrap();
+        let hits = compare_alignments(&paths).unwrap();
         let mut observed: Vec<_> = hits.keys().cloned().collect();
         observed.sort();
 
@@ -261,6 +244,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies missing samples limit comparisons to comparable gene pairs.
     fn variable_sample_genes_accumulate_only_comparable_pairs() {
         let dir = TempDir::new().unwrap();
         let mut paths = Vec::new();
@@ -287,7 +271,7 @@ mod tests {
             ));
         }
 
-        let hits = compare_alignments(&paths, 2).unwrap();
+        let hits = compare_alignments(&paths).unwrap();
         let mut observed: Vec<_> = hits.keys().cloned().collect();
         observed.sort();
 
@@ -300,6 +284,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies pair statistics skip genes missing either requested sample.
     fn comparable_pair_stats_skip_genes_missing_either_sample() {
         let dir = TempDir::new().unwrap();
         let gene_ab = write_alignment(&dir, "gene_ab.aln", ">alpha\nAAAA\n>beta\nCCCC\n");
@@ -316,23 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_alignments_rejects_zero_threads() {
-        let error = compare_alignments::<PathBuf>(&[], 0).unwrap_err();
-
-        assert!(matches!(
-            error,
-            CompareError::InvalidThreadCount { threads: 0 }
-        ));
-    }
-
-    #[test]
-    fn rayon_pool_uses_requested_thread_count() {
-        let threads = run_with_thread_pool(2, rayon::current_num_threads).unwrap();
-
-        assert_eq!(threads, 2);
-    }
-
-    #[test]
+    // Verifies presence output keeps gene order and sorted sample columns.
     fn presence_table_keeps_all_input_genes_in_order_with_sorted_samples() {
         let dir = TempDir::new().unwrap();
         let paths = [
@@ -353,7 +322,7 @@ mod tests {
             ),
         ];
 
-        let table = infer_recombination_presence(&paths, 1).unwrap();
+        let table = infer_recombination_presence(&paths).unwrap();
 
         assert_eq!(table.sample_names, vec!["alpha", "beta"]);
         assert_eq!(

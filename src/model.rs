@@ -12,6 +12,7 @@ pub(crate) struct PairGeneStats<'a> {
     pub(crate) length: usize,
 }
 
+// Selects genes above the inferred recombination threshold.
 pub(crate) fn select_recombinant_gene_indices<'a>(
     genes: impl IntoIterator<Item = PairGeneStats<'a>>,
 ) -> Vec<usize> {
@@ -28,6 +29,7 @@ pub(crate) fn select_recombinant_gene_indices<'a>(
         .collect()
 }
 
+// Orders genes by divergence and deterministic tie-breakers.
 fn order_pair_genes(genes: &mut [PairGeneStats<'_>]) {
     genes.sort_by(|left, right| {
         snp_proportion(*left)
@@ -37,10 +39,12 @@ fn order_pair_genes(genes: &mut [PairGeneStats<'_>]) {
     });
 }
 
+// Computes the SNP proportion for one pairwise gene comparison.
 fn snp_proportion(gene: PairGeneStats<'_>) -> f64 {
     gene.snps as f64 / gene.length as f64
 }
 
+// Computes normalized threshold model probabilities for ordered genes.
 fn threshold_model_probabilities(ordered_genes: &[PairGeneStats<'_>]) -> Vec<f64> {
     if ordered_genes.is_empty() {
         return Vec::new();
@@ -104,12 +108,14 @@ fn threshold_model_probabilities(ordered_genes: &[PairGeneStats<'_>]) -> Vec<f64
     normalised_weights
 }
 
+// Computes the beta-binomial alternative log likelihood.
 fn alt_log_likelihood(a0: f64, a1: f64, n0: f64, n1: f64) -> f64 {
     ln_gamma(a0 + a1) - ln_gamma(a0 + a1 + n0 + n1) + ln_gamma(a0 + n0) + ln_gamma(a1 + n1)
         - ln_gamma(a0)
         - ln_gamma(a1)
 }
 
+// Converts model probabilities into an integer threshold.
 fn find_threshold(model_probs: &[f64]) -> usize {
     let expected_threshold: f64 = model_probs
         .iter()
@@ -120,6 +126,7 @@ fn find_threshold(model_probs: &[f64]) -> usize {
     round_ties_to_even(expected_threshold)
 }
 
+// Rounds a non-negative value using ties-to-even semantics.
 fn round_ties_to_even(value: f64) -> usize {
     debug_assert!(value >= 0.0);
 
@@ -139,6 +146,7 @@ fn round_ties_to_even(value: f64) -> usize {
 mod tests {
     use super::*;
 
+    // Builds pairwise gene stats for model tests.
     fn gene(
         gene_index: usize,
         gene_id: &'static str,
@@ -153,12 +161,14 @@ mod tests {
         }
     }
 
+    // Returns gene IDs after applying model ordering.
     fn ordered_ids(mut genes: Vec<PairGeneStats<'static>>) -> Vec<&'static str> {
         order_pair_genes(&mut genes);
         genes.into_iter().map(|gene| gene.gene_id).collect()
     }
 
     #[test]
+    // Verifies genes sort by increasing SNP proportion.
     fn sorts_by_increasing_snp_proportion() {
         let observed = ordered_ids(vec![gene(0, "higher", 2, 10), gene(1, "lower", 1, 10)]);
 
@@ -166,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies equal SNP proportions prefer longer alignments.
     fn tie_breaks_by_longer_alignment_first() {
         let observed = ordered_ids(vec![gene(0, "short", 1, 10), gene(1, "long", 2, 20)]);
 
@@ -173,6 +184,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies remaining ties are broken by gene identifier.
     fn final_tie_breaker_is_gene_id() {
         let observed = ordered_ids(vec![gene(0, "gene_b", 1, 10), gene(1, "gene_a", 1, 10)]);
 
@@ -180,6 +192,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies thresholding selects the reference recombinant tail.
     fn bayesian_threshold_selects_python_reference_tail() {
         let genes = vec![
             gene(0, "high", 8, 10),
@@ -193,6 +206,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies threshold rounding matches Python's ties-to-even behavior.
     fn threshold_uses_python_rounding_ties_to_even() {
         assert_eq!(round_ties_to_even(2.5), 2);
         assert_eq!(round_ties_to_even(3.5), 4);

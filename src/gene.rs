@@ -11,6 +11,7 @@ struct SampleBases {
 }
 
 impl SampleBases {
+    // Encodes a sequence into per-base bitmap positions.
     fn from_sequence(sequence: &[u8]) -> Self {
         let mut bases = SampleBases::default();
 
@@ -21,6 +22,7 @@ impl SampleBases {
         bases
     }
 
+    // Records one alignment position under its matching base set.
     fn insert_base(&mut self, position: u32, base: u8) {
         match base.to_ascii_uppercase() {
             b'A' => {
@@ -102,6 +104,7 @@ pub(crate) struct Gene {
 }
 
 impl Gene {
+    // Builds a gene from ordered sample names and aligned sequences.
     pub(crate) fn new(
         name: String,
         alignment_len: usize,
@@ -128,6 +131,7 @@ impl Gene {
         }
     }
 
+    // Counts non-matching alignment columns between two samples.
     pub(crate) fn snp_count(&self, sample_a: usize, sample_b: usize) -> usize {
         let left = &self.samples[sample_a];
         let right = &self.samples[sample_b];
@@ -141,14 +145,17 @@ impl Gene {
         self.alignment_len - matches.len() as usize
     }
 
+    // Returns the gene identifier.
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
+    // Returns the alignment length in columns.
     pub(crate) fn alignment_len(&self) -> usize {
         self.alignment_len
     }
 
+    // Looks up the internal index for a sample name.
     pub(crate) fn sample_index(&self, sample: &str) -> Option<usize> {
         self.sample_indices.get(sample).copied()
     }
@@ -158,6 +165,7 @@ impl Gene {
 mod tests {
     use super::*;
 
+    // Builds a two-sample test gene from byte sequences.
     fn gene(sequence_a: &[u8], sequence_b: &[u8]) -> Gene {
         Gene::new(
             "gene".to_string(),
@@ -167,10 +175,12 @@ mod tests {
         )
     }
 
+    // Counts SNPs for a single-base two-sample gene.
     fn one_base_snp_count(left: u8, right: u8) -> usize {
         gene(&[left], &[right]).snp_count(0, 1)
     }
 
+    // Asserts bitmap membership for one encoded base.
     fn assert_membership(
         base: u8,
         expected_a: bool,
@@ -189,12 +199,14 @@ mod tests {
     }
 
     #[test]
+    // Verifies exact DNA bases only match identical bases.
     fn exact_bases_match_only_themselves() {
         assert_eq!(gene(b"ACGT", b"ACGT").snp_count(0, 1), 0);
         assert_eq!(gene(b"ACGT", b"TGCA").snp_count(0, 1), 4);
     }
 
     #[test]
+    // Verifies IUPAC ambiguity codes map to the expected base sets.
     fn iupac_bases_encode_expected_memberships() {
         let expectations = [
             (b'A', true, false, false, false, false),
@@ -227,6 +239,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies ambiguous bases match when their base sets overlap.
     fn iupac_bases_match_when_any_membership_overlaps() {
         assert_eq!(one_base_snp_count(b'R', b'A'), 0);
         assert_eq!(one_base_snp_count(b'R', b'G'), 0);
@@ -237,6 +250,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies N and unknown non-gap bases match ordinary bases.
     fn n_and_unknown_non_gap_characters_match_any_ordinary_base() {
         assert_eq!(gene(b"NX?z", b"ACGT").snp_count(0, 1), 0);
         assert_eq!(one_base_snp_count(b'n', b't'), 0);
@@ -245,6 +259,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies gaps only match other gaps.
     fn gap_matches_only_gap() {
         assert_membership(b'-', false, false, false, false, true);
         assert_eq!(one_base_snp_count(b'-', b'-'), 0);
@@ -255,6 +270,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies simple two-sample SNP counting.
     fn two_sample_one_gene_has_expected_snp_count() {
         let gene = gene(b"AAAA", b"AACC");
 
@@ -262,6 +278,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies gap mismatches contribute to the SNP count.
     fn gap_mismatch_positions_are_counted() {
         let gene = gene(b"A-N?", b"AA-G");
 

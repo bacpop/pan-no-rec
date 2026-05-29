@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 type RecombinationGraph = UnGraph<usize, ()>;
 
+// Infers sample-level recombination presence from pairwise gene hits.
 pub(crate) fn infer_gene_presence(
     sample_indices: &HashMap<&str, usize>,
     sample_count: usize,
@@ -18,6 +19,7 @@ pub(crate) fn infer_gene_presence(
     presence
 }
 
+// Builds an undirected graph whose edges are recombinant sample pairs.
 fn recombinant_pair_graph(
     sample_indices: &HashMap<&str, usize>,
     pairs: &[(String, String)],
@@ -52,6 +54,7 @@ fn recombinant_pair_graph(
     graph
 }
 
+// Prunes the graph to identify samples implicated by dense hit structure.
 fn prune_recombinant_samples(graph: &RecombinationGraph) -> Vec<usize> {
     let mut active = vec![true; graph.node_count()];
     let mut active_count = graph.node_count();
@@ -121,6 +124,7 @@ fn prune_recombinant_samples(graph: &RecombinationGraph) -> Vec<usize> {
     recombinant_samples
 }
 
+// Counts each active node's active neighbors.
 fn active_degrees(graph: &RecombinationGraph, active: &[bool]) -> Vec<usize> {
     let mut degrees = vec![0; active.len()];
 
@@ -134,6 +138,7 @@ fn active_degrees(graph: &RecombinationGraph, active: &[bool]) -> Vec<usize> {
     degrees
 }
 
+// Finds the highest non-empty k-core among active nodes.
 fn highest_non_empty_k_core(
     graph: &RecombinationGraph,
     active: &[bool],
@@ -149,6 +154,7 @@ fn highest_non_empty_k_core(
     Vec::new()
 }
 
+// Computes the active nodes that remain in a specific k-core.
 fn k_core_nodes(graph: &RecombinationGraph, active: &[bool], k: usize) -> Vec<NodeIndex> {
     if k == 0 {
         return graph
@@ -187,6 +193,7 @@ fn k_core_nodes(graph: &RecombinationGraph, active: &[bool], k: usize) -> Vec<No
         .collect()
 }
 
+// Removes active graph nodes and records their sample indices.
 fn remove_nodes(
     graph: &RecombinationGraph,
     active: &mut [bool],
@@ -205,6 +212,7 @@ fn remove_nodes(
     }
 }
 
+// Checks whether a graph node is currently active.
 fn is_active(active: &[bool], node: NodeIndex) -> bool {
     active.get(node.index()).copied().unwrap_or(false)
 }
@@ -213,6 +221,7 @@ fn is_active(active: &[bool], node: NodeIndex) -> bool {
 mod tests {
     use super::*;
 
+    // Builds a test graph from sample-indexed edges.
     fn graph_from_edges(node_count: usize, edges: &[(usize, usize)]) -> RecombinationGraph {
         let mut graph = RecombinationGraph::default();
         let nodes: Vec<_> = (0..node_count)
@@ -226,6 +235,7 @@ mod tests {
         graph
     }
 
+    // Builds a complete test graph with the requested node count.
     fn complete_graph(node_count: usize) -> RecombinationGraph {
         let mut edges = Vec::new();
         for left in 0..node_count {
@@ -237,16 +247,19 @@ mod tests {
         graph_from_edges(node_count, &edges)
     }
 
+    // Marks every node in a test graph as active.
     fn active_nodes(graph: &RecombinationGraph) -> Vec<bool> {
         vec![true; graph.node_count()]
     }
 
+    // Converts graph nodes into sorted sample indices for assertions.
     fn node_samples(graph: &RecombinationGraph, nodes: Vec<NodeIndex>) -> Vec<usize> {
         let mut samples: Vec<_> = nodes.into_iter().map(|node| graph[node]).collect();
         samples.sort_unstable();
         samples
     }
 
+    // Runs presence inference from compact sample and pair fixtures.
     fn presence_for_pairs(samples: &[&str], pairs: &[(&str, &str)]) -> Vec<u8> {
         let sample_indices: HashMap<_, _> = samples
             .iter()
@@ -262,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies a complete graph remains intact at its maximum k-core.
     fn k_core_of_complete_graph_contains_all_nodes_at_max_k() {
         let graph = complete_graph(5);
 
@@ -271,6 +285,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies k-core search lowers k when a star has no max core.
     fn highest_non_empty_k_core_lowers_past_empty_star_max_core() {
         let graph = graph_from_edges(6, &[(0, 1), (0, 2), (0, 3), (0, 4), (0, 5)]);
         let active = active_nodes(&graph);
@@ -282,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies k-core search lowers k for sparse path graphs.
     fn highest_non_empty_k_core_lowers_for_sparse_path() {
         let graph = graph_from_edges(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
         let active = active_nodes(&graph);
@@ -293,6 +309,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies isolated residual nodes stop pruning cleanly.
     fn isolated_residual_nodes_do_not_loop_forever() {
         let graph = graph_from_edges(4, &[]);
 
@@ -302,6 +319,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies small initial graphs do not mark recombination presence.
     fn pruning_skips_initial_graphs_with_at_most_three_nodes() {
         let observed = presence_for_pairs(
             &["alpha", "beta", "gamma", "delta"],
@@ -312,6 +330,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies a dominant hub is marked without marking its leaves.
     fn hub_degree_more_than_three_times_second_highest_marks_only_hub() {
         let observed = presence_for_pairs(
             &["hub", "s1", "s2", "s3", "s4"],
@@ -322,6 +341,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies regular dense structure marks all remaining nodes.
     fn regular_graph_marks_all_remaining_nodes() {
         let observed = presence_for_pairs(
             &["s0", "s1", "s2", "s3"],
@@ -332,6 +352,7 @@ mod tests {
     }
 
     #[test]
+    // Verifies pruning stops once three or fewer nodes remain.
     fn pruning_stops_when_removals_leave_at_most_three_nodes() {
         let observed = presence_for_pairs(
             &["s0", "s1", "s2", "s3", "tail"],

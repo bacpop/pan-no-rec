@@ -1,17 +1,9 @@
-use rayon::ThreadPoolBuildError;
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum CompareError {
-    InvalidThreadCount {
-        threads: usize,
-    },
-    ThreadPoolBuild {
-        threads: usize,
-        source: ThreadPoolBuildError,
-    },
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -56,17 +48,9 @@ pub enum CompareError {
 }
 
 impl fmt::Display for CompareError {
+    // Formats comparison errors as user-facing messages.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CompareError::InvalidThreadCount { threads } => {
-                write!(f, "thread count must be at least 1, got {threads}")
-            }
-            CompareError::ThreadPoolBuild { threads, source } => {
-                write!(
-                    f,
-                    "failed to build Rayon thread pool with {threads} threads: {source}"
-                )
-            }
             CompareError::Io { path, source } => {
                 write!(f, "failed to read alignment '{}': {source}", path.display())
             }
@@ -151,9 +135,9 @@ impl fmt::Display for CompareError {
 }
 
 impl Error for CompareError {
+    // Exposes wrapped parsing and I/O errors.
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            CompareError::ThreadPoolBuild { source, .. } => Some(source),
             CompareError::Io { source, .. } => Some(source),
             CompareError::FastaParse { source, .. } => Some(source),
             CompareError::HeaderUtf8 { source, .. } => Some(source),
