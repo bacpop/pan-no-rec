@@ -1,5 +1,7 @@
 use petgraph::graph::{NodeIndex, UnGraph};
 use rayon::prelude::*;
+use crate::get_progress_bar;
+use indicatif::ParallelProgressIterator;
 use std::collections::HashMap;
 
 use crate::dists::PairHits;
@@ -24,14 +26,17 @@ pub fn presence_table_from_pair_hits(
     sample_names: &[String],
     genes: &[Gene],
     hits: &PairHits,
+    quiet: bool,
 ) -> RecombinationTable {
     let sample_indices: HashMap<_, _> = sample_names
         .iter()
         .enumerate()
         .map(|(index, name)| (name.as_str(), index))
         .collect();
+    let progress_bar = get_progress_bar(genes.len(), false, quiet);
     let rows = genes
         .par_iter()
+        .progress_with(progress_bar)
         .map(|gene| {
             let pairs = hits.get(gene.name()).map(Vec::as_slice).unwrap_or(&[]);
 

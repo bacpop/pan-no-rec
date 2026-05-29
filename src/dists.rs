@@ -1,5 +1,7 @@
 use crate::gene::Gene;
 use crate::model::{PairGeneStats, select_recombinant_gene_indices};
+use crate::get_progress_bar;
+use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -7,14 +9,16 @@ pub type PairHits = HashMap<String, Vec<(String, String)>>;
 type SamplePair = (String, String);
 
 // Runs pairwise comparison across all sample pairs for loaded genes.
-pub fn compare_loaded_alignments(sample_names: &[String], genes: &[Gene]) -> PairHits {
-    let sample_pair_count = sample_pair_count(sample_names.len());
+pub fn compare_loaded_alignments(sample_names: &[String], genes: &[Gene], quiet: bool) -> PairHits {
     // Flatten the upper triangle of the sample-by-sample matrix into one Rayon
     // range. That gives Rayon similarly sized units of work for each sample pair,
     // instead of parallelizing only by the outer sample index where early rows are
     // much larger than later rows.
+    let sample_pair_count = sample_pair_count(sample_names.len());
+    let progress_bar = get_progress_bar(sample_pair_count, true, quiet);
     let gene_pair_hits: Vec<_> = (0..sample_pair_count)
         .into_par_iter()
+        .progress_with(progress_bar)
         .flat_map_iter(|pair_offset| {
             let (sample_a, sample_b) = sample_pair_indices(sample_names.len(), pair_offset);
             selected_pair_hits(genes, &sample_names[sample_a], &sample_names[sample_b])
@@ -120,7 +124,7 @@ mod tests {
         P: AsRef<Path>,
     {
         let (sample_names, genes) = load_genes(aln_paths).expect("Test gene load failed");
-        let hits = compare_loaded_alignments(&sample_names, &genes);
+        let hits = compare_loaded_alignments(&sample_names, &genes, true);
         (sample_names, genes, hits)
     }
 
@@ -129,7 +133,7 @@ mod tests {
         P: AsRef<Path>,
     {
         let (sample_names, genes, hits) = compare_alignments(aln_paths);
-        presence_table_from_pair_hits(&sample_names, &genes, &hits)
+        presence_table_from_pair_hits(&sample_names, &genes, &hits, true)
     }
 
     // Writes a temporary FASTA alignment for tests.

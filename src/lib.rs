@@ -1,5 +1,7 @@
 use anyhow::{Error, anyhow};
 use rayon::ThreadPoolBuilder;
+use indicatif::{ProgressBar, ProgressStyle};
+
 use std::io::stdout;
 use std::time::Instant;
 
@@ -20,6 +22,21 @@ mod model;
 
 mod graph;
 use graph::presence_table_from_pair_hits;
+
+/// Create a progress bar for use in iterators
+pub fn get_progress_bar(length: usize, percent: bool, quiet: bool) -> ProgressBar {
+    if quiet {
+        ProgressBar::hidden()
+    } else {
+        let style = if percent {
+            ProgressStyle::with_template("{percent}% {bar:80.cyan/blue} eta:{eta}").unwrap()
+        } else {
+            ProgressStyle::with_template("{human_pos}/{human_len} {bar:80.cyan/blue} eta:{eta}")
+                .unwrap()
+        };
+        ProgressBar::new(length as u64).with_style(style)
+    }
+}
 
 #[doc(hidden)]
 #[cfg(not(target_arch = "wasm32"))]
@@ -61,10 +78,10 @@ pub fn main() -> Result<(), Error> {
     }
 
     log::info!("Running recombination detection: fitting pairwise distance models");
-    let gene_hits = compare_loaded_alignments(&sample_names, &genes);
+    let gene_hits = compare_loaded_alignments(&sample_names, &genes, args.quiet);
 
     log::info!("Running recombination detection: using graphs to find genes");
-    let table = presence_table_from_pair_hits(&sample_names, &genes, &gene_hits);
+    let table = presence_table_from_pair_hits(&sample_names, &genes, &gene_hits, args.quiet);
 
     log::info!("Writing output");
     write_recombination_table(&table, stdout().lock())
