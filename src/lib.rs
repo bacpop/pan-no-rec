@@ -9,9 +9,7 @@ mod cli;
 use crate::cli::cli_args;
 
 mod io;
-use io::{
-    load_genes, read_msa_list, read_panaroo_dir, write_paralog_report, write_recombination_table,
-};
+use io::{load_genes, write_paralog_report, write_recombination_table};
 
 mod dists;
 use dists::compare_loaded_alignments;
@@ -63,13 +61,13 @@ pub fn main() -> Result<()> {
 
     let start = Instant::now();
 
-    log::info!("Reading input files");
-    let aln_paths = match (&args.msa_list, &args.panaroo_dir) {
-        (Some(path), None) => read_msa_list(path)?,
-        (None, Some(path)) => read_panaroo_dir(path)?,
-        _ => unreachable!("clap requires exactly one input source"),
-    };
-    let loaded = load_genes(&aln_paths, args.paralog_mode, args.quiet)?;
+    log::info!("Reading Panaroo input files");
+    let loaded = load_genes(
+        &args.panaroo_dir,
+        args.paralog_mode,
+        args.max_entropy,
+        args.quiet,
+    )?;
     if !loaded.paralogs.is_empty() {
         write_paralog_report(&args.paralog_report, &loaded.paralogs)?;
         log::warn!(

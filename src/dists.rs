@@ -152,12 +152,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    fn compare_alignments<P>(aln_paths: &[P]) -> (Vec<String>, Vec<Gene>, PairHits)
-    where
-        P: AsRef<Path> + Sync,
-    {
+    fn compare_alignments(panaroo_dir: &Path) -> (Vec<String>, Vec<Gene>, PairHits) {
         let loaded =
-            load_genes(aln_paths, ParalogMode::First, true).expect("Test gene load failed");
+            load_genes(panaroo_dir, ParalogMode::First, None, true).expect("Test gene load failed");
         let hits = compare_loaded_alignments(loaded.sample_names.len(), &loaded.genes, false, true);
         (loaded.sample_names, loaded.genes, hits)
     }
@@ -169,17 +166,25 @@ mod tests {
         }
     }
 
-    fn infer_recombination_presence<P>(aln_paths: &[P]) -> Vec<RecombinationRow>
-    where
-        P: AsRef<Path> + Sync,
-    {
-        let (sample_names, genes, hits) = compare_alignments(aln_paths);
+    fn infer_recombination_presence(panaroo_dir: &Path) -> Vec<RecombinationRow> {
+        let (sample_names, genes, hits) = compare_alignments(panaroo_dir);
         presence_table_from_pair_hits(sample_names.len(), &genes, &hits, true)
+    }
+
+    // Writes the required Panaroo Rtab header fixture.
+    fn write_rtab(dir: &TempDir, sample_names: &[&str]) {
+        fs::write(
+            dir.path().join("gene_presence_absence.Rtab"),
+            format!("Gene\t{}\n", sample_names.join("\t")),
+        )
+        .unwrap();
     }
 
     // Writes a temporary FASTA alignment for tests.
     fn write_alignment(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
-        let path = dir.path().join(name);
+        let alignment_dir = dir.path().join("aligned_gene_sequences");
+        fs::create_dir_all(&alignment_dir).unwrap();
+        let path = alignment_dir.join(name);
         fs::write(&path, contents).unwrap();
         path
     }
@@ -201,19 +206,15 @@ mod tests {
     // Verifies thresholding returns the expected high-divergence gene hits.
     fn bayesian_threshold_returns_expected_gene_keys_and_pairs() {
         let dir = TempDir::new().unwrap();
-        let mut paths = Vec::new();
+        write_rtab(&dir, &["s1", "s2"]);
 
         for mismatches in 0..12 {
             let s2 = format!("{}{}", "C".repeat(mismatches), "A".repeat(12 - mismatches));
             let contents = format!(">s1\n{}\n>s2\n{}\n", "A".repeat(12), s2);
-            paths.push(write_alignment(
-                &dir,
-                &format!("gene{mismatches:02}.aln"),
-                &contents,
-            ));
+            write_alignment(&dir, &format!("gene{mismatches:02}.aln.fas"), &contents);
         }
 
-        let mut hits = compare_alignments(&paths);
+        let mut hits = compare_alignments(dir.path());
         sort_pair_hits(&mut hits.2);
         let mut observed: Vec<_> = hits.2.keys().copied().collect();
         observed.sort();
@@ -229,7 +230,7 @@ mod tests {
     // Verifies missing samples limit comparisons to comparable gene pairs.
     fn variable_sample_genes_accumulate_only_comparable_pairs() {
         let dir = TempDir::new().unwrap();
-        let mut paths = Vec::new();
+        write_rtab(&dir, &["alpha", "beta", "gamma"]);
 
         for mismatches in 0..12 {
             let beta = format!("{}{}", "C".repeat(mismatches), "A".repeat(12 - mismatches));
@@ -246,14 +247,10 @@ mod tests {
                 format!(">alpha;extra\n{}\n>beta;extra\n{}\n", "A".repeat(12), beta)
             };
 
-            paths.push(write_alignment(
-                &dir,
-                &format!("gene{mismatches:02}.aln"),
-                &contents,
-            ));
+            write_alignment(&dir, &format!("gene{mismatches:02}.aln.fas"), &contents);
         }
 
-        let mut hits = compare_alignments(&paths);
+        let mut hits = compare_alignments(dir.path());
         sort_pair_hits(&mut hits.2);
         let mut observed: Vec<_> = hits.2.keys().copied().collect();
         observed.sort();
@@ -269,11 +266,11 @@ mod tests {
     // Verifies pair statistics skip genes missing either requested sample.
     fn comparable_pair_stats_skip_genes_missing_either_sample() {
         let dir = TempDir::new().unwrap();
-        let gene_ab = write_alignment(&dir, "gene_ab.aln", ">alpha\nAAAA\n>beta\nCCCC\n");
-        let gene_ag = write_alignment(&dir, "gene_ag.aln", ">alpha\nAAAA\n>gamma\nTTTT\n");
-        let gene_bg = write_alignment(&dir, "gene_bg.aln", ">beta\nCCCC\n>gamma\nTTTT\n");
-        let loaded =
-            crate::io::load_genes(&[gene_ab, gene_ag, gene_bg], ParalogMode::First, true).unwrap();
+        write_rtab(&dir, &["alpha", "beta", "gamma"]);
+        write_alignment(&dir, "gene_ab.aln.fas", ">alpha\nAAAA\n>beta\nCCCC\n");
+        write_alignment(&dir, "gene_ag.aln.fas", ">alpha\nAAAA\n>gamma\nTTTT\n");
+        write_alignment(&dir, "gene_bg.aln.fas", ">beta\nCCCC\n>gamma\nTTTT\n");
+        let loaded = crate::io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
         let gene_sort_ranks = gene_sort_ranks(&loaded.genes);
 
         let observed: Vec<_> =
@@ -289,12 +286,10 @@ mod tests {
     // Verifies zero-length effective comparisons do not reach the model fit.
     fn comparable_pair_stats_skip_zero_length_alignments() {
         let dir = TempDir::new().unwrap();
-        let zero_length = write_alignment(&dir, "gene_zero.aln", ">alpha\n----\n>beta\nAAAA\n");
-        let positive_length =
-            write_alignment(&dir, "gene_positive.aln", ">alpha\nAAAA\n>beta\nAAAT\n");
-        let loaded =
-            crate::io::load_genes(&[zero_length, positive_length], ParalogMode::First, true)
-                .unwrap();
+        write_rtab(&dir, &["alpha", "beta"]);
+        write_alignment(&dir, "gene_zero.aln.fas", ">alpha\n----\n>beta\nAAAA\n");
+        write_alignment(&dir, "gene_positive.aln.fas", ">alpha\nAAAA\n>beta\nAAAT\n");
+        let loaded = crate::io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
         let gene_sort_ranks = gene_sort_ranks(&loaded.genes);
 
         let observed: Vec<_> =
@@ -303,36 +298,35 @@ mod tests {
                 .map(|stats| (stats.gene_index, stats.snps, stats.length))
                 .collect();
 
-        assert_eq!(observed, vec![(1, 1, 4)]);
+        assert_eq!(observed, vec![(0, 1, 4)]);
 
         let hits = compare_loaded_alignments(loaded.sample_names.len(), &loaded.genes, false, true);
 
-        assert!(!hits.contains_key(&0));
+        assert!(!hits.contains_key(&1));
     }
 
     #[test]
-    // Verifies presence output keeps gene order.
-    fn presence_table_keeps_all_input_genes_in_order() {
+    // Verifies presence output keeps sorted alignment order.
+    fn presence_table_keeps_all_loaded_genes_in_order() {
         let dir = TempDir::new().unwrap();
-        let paths = [
-            write_alignment(
-                &dir,
-                "gene_low.aln",
-                ">beta\nAAAAAAAAAA\n>alpha\nAAAAAAAAAA\n",
-            ),
-            write_alignment(
-                &dir,
-                "gene_middle.aln",
-                ">beta\nCAAAAAAAAA\n>alpha\nAAAAAAAAAA\n",
-            ),
-            write_alignment(
-                &dir,
-                "gene_high.aln",
-                ">beta\nCCCCCCCCAA\n>alpha\nAAAAAAAAAA\n",
-            ),
-        ];
+        write_rtab(&dir, &["alpha", "beta"]);
+        write_alignment(
+            &dir,
+            "gene_low.aln.fas",
+            ">beta\nAAAAAAAAAA\n>alpha\nAAAAAAAAAA\n",
+        );
+        write_alignment(
+            &dir,
+            "gene_middle.aln.fas",
+            ">beta\nCAAAAAAAAA\n>alpha\nAAAAAAAAAA\n",
+        );
+        write_alignment(
+            &dir,
+            "gene_high.aln.fas",
+            ">beta\nCCCCCCCCAA\n>alpha\nAAAAAAAAAA\n",
+        );
 
-        let rows = infer_recombination_presence(&paths);
+        let rows = infer_recombination_presence(dir.path());
 
         assert_eq!(
             rows,

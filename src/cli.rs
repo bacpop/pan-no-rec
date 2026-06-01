@@ -1,4 +1,4 @@
-use clap::{ArgGroup, Parser, ValueEnum};
+use clap::{Parser, ValueEnum};
 
 use std::fmt;
 use std::path::PathBuf;
@@ -29,18 +29,12 @@ impl fmt::Display for ParalogMode {
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Find recombination from pangenome alignments")]
-#[command(group(
-    ArgGroup::new("input")
-        .required(true)
-        .multiple(false)
-        .args(["msa_list", "panaroo_dir"])
-))]
 pub(crate) struct Args {
-    #[arg(long, value_name = "PATH")]
-    pub msa_list: Option<PathBuf>,
-
     #[arg(long, value_name = "DIR")]
-    pub panaroo_dir: Option<PathBuf>,
+    pub panaroo_dir: PathBuf,
+
+    #[arg(long, value_name = "FLOAT", value_parser = parse_max_entropy)]
+    pub max_entropy: Option<f64>,
 
     #[arg(long, default_value_t = 1, value_parser = parse_threads)]
     pub threads: usize,
@@ -74,6 +68,19 @@ fn parse_threads(value: &str) -> Result<usize, String> {
         Err("thread count must be at least 1".to_string())
     } else {
         Ok(threads)
+    }
+}
+
+// Parses an optional finite entropy threshold for filtering Panaroo alignments.
+fn parse_max_entropy(value: &str) -> Result<f64, String> {
+    let threshold = value
+        .parse::<f64>()
+        .map_err(|source| format!("invalid entropy threshold: {source}"))?;
+
+    if threshold.is_finite() {
+        Ok(threshold)
+    } else {
+        Err("entropy threshold must be finite".to_string())
     }
 }
 

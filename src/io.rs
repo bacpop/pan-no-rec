@@ -6,9 +6,9 @@ use flate2::read::MultiGzDecoder;
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use seq_io::fasta::{Reader, Record};
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, hash_map::Entry};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -18,15 +18,6 @@ pub(crate) struct LoadedAlignments {
     pub(crate) paralogs: Vec<(String, usize)>,
 }
 
-#[derive(Debug)]
-struct RawAlignment {
-    gene_name: String,
-    sample_names: Vec<String>,
-    sequences: Vec<Vec<u8>>,
-    alignment_len: usize,
-    paralog: Option<usize>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RecombinationRow {
     pub(crate) gene_index: usize,
@@ -34,64 +25,36 @@ pub(crate) struct RecombinationRow {
 }
 
 #[derive(Debug)]
-struct RawSampleGroup {
-    sample_name: String,
-    records: Vec<RawSampleRecord>,
+struct ParsedGene {
+    gene: Gene,
+    paralog: Option<(String, usize)>,
 }
 
-#[derive(Debug)]
-struct RawSampleRecord {
-    sequence: Vec<u8>,
-    non_gap_count: usize,
-}
+type SampleRecords = Vec<(Vec<u8>, usize)>;
+type SampleGroup = (String, SampleRecords);
 
-// Reads an MSA list file and resolves its entries to paths.
-pub fn read_msa_list(path: &Path) -> Result<Vec<PathBuf>> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read MSA list '{}'", path.display()))?;
-    Ok(parse_msa_list(path, &contents))
-}
-
-// Finds Panaroo gene alignment files in a directory or its standard fallback.
+// Finds Panaroo gene alignment files in the standard alignment directory.
 pub fn read_panaroo_dir(path: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = find_panaroo_alignments(path)?;
-    if paths.is_empty() {
-        let fallback = path.join("aligned_gene_sequences");
-        paths = find_optional_panaroo_alignments(&fallback)?;
-    }
+    let alignment_dir = path.join("aligned_gene_sequences");
+    let paths = collect_panaroo_alignments(&alignment_dir)?;
 
     if paths.is_empty() {
         bail!(
-            "found no Panaroo alignment files ending in .aln.fas in '{}' or '{}'",
-            path.display(),
-            path.join("aligned_gene_sequences").display()
+            "found no Panaroo alignment files ending in .aln.fas in '{}'",
+            alignment_dir.display()
         );
     }
 
     Ok(paths)
 }
 
-// Collects top-level Panaroo alignment files from a readable directory.
-fn find_panaroo_alignments(dir: &Path) -> Result<Vec<PathBuf>> {
-    collect_panaroo_alignments(dir, true)
-}
-
-// Collects Panaroo alignment files from an optional fallback directory.
-fn find_optional_panaroo_alignments(dir: &Path) -> Result<Vec<PathBuf>> {
-    collect_panaroo_alignments(dir, false)
-}
-
-fn collect_panaroo_alignments(dir: &Path, required: bool) -> Result<Vec<PathBuf>> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Vec::new());
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read Panaroo directory '{}'", dir.display()));
-        }
-    };
+fn collect_panaroo_alignments(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = fs::read_dir(dir).with_context(|| {
+        format!(
+            "failed to read Panaroo alignment directory '{}'",
+            dir.display()
+        )
+    })?;
 
     let mut paths = Vec::new();
     for entry in entries {
@@ -166,65 +129,35 @@ pub(crate) fn write_paralog_report(path: &Path, rows: &[(String, usize)]) -> Res
     Ok(())
 }
 
-// Parses list-file contents, ignoring blanks and comments.
-fn parse_msa_list(list_path: &Path, contents: &str) -> Vec<PathBuf> {
-    let base_dir = list_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| {
-            let path = PathBuf::from(line);
-            if path.is_absolute() {
-                path
-            } else {
-                base_dir.join(path)
-            }
-        })
-        .collect()
-}
-
-// Loads all input alignments into genes and sorted sample names.
-pub(crate) fn load_genes<P>(
-    aln_paths: &[P],
+// Loads all Panaroo alignments into genes using the Rtab header sample order.
+pub(crate) fn load_genes(
+    panaroo_dir: &Path,
     paralog_mode: ParalogMode,
+    max_entropy: Option<f64>,
     quiet: bool,
-) -> Result<LoadedAlignments>
-where
-    P: AsRef<Path> + Sync,
-{
-    let mut all_samples = HashSet::new();
-
-    let pbar = get_progress_bar(aln_paths.len(), false, quiet);
-    let raw_alignments: Vec<RawAlignment> = aln_paths
-        .par_iter()
-        .progress_with(pbar)
-        .map(|aln| parse_raw_alignment(aln.as_ref(), paralog_mode))
-        .collect::<Result<Vec<_>>>()?;
-
-    for raw in &raw_alignments {
-        all_samples.extend(raw.sample_names.iter().cloned());
+) -> Result<LoadedAlignments> {
+    let rtab_path = panaroo_dir.join("gene_presence_absence.Rtab");
+    let sample_names = read_rtab_sample_names(&rtab_path)?;
+    let sample_indices = build_sample_indices(&sample_names, &rtab_path)?;
+    let mut aln_paths = read_panaroo_dir(panaroo_dir)?;
+    if let Some(threshold) = max_entropy {
+        aln_paths = filter_alignments_by_entropy(panaroo_dir, aln_paths, threshold)?;
     }
 
-    let mut sample_names: Vec<_> = all_samples.into_iter().collect();
-    sample_names.sort_unstable();
-    let sample_indices: HashMap<_, _> = sample_names
-        .iter()
-        .enumerate()
-        .map(|(index, sample)| (sample.as_str(), index))
-        .collect();
+    let pbar = get_progress_bar(aln_paths.len(), false, quiet);
+    let parsed_genes: Vec<ParsedGene> = aln_paths
+        .par_iter()
+        .progress_with(pbar)
+        .map(|aln| parse_gene_alignment(aln, &sample_indices, paralog_mode))
+        .collect::<Result<Vec<_>>>()?;
 
-    let mut genes = Vec::with_capacity(raw_alignments.len());
+    let mut genes = Vec::with_capacity(parsed_genes.len());
     let mut paralogs = Vec::new();
-    for raw in raw_alignments {
-        if let Some(paralog_samples) = raw.paralog {
-            paralogs.push((raw.gene_name.clone(), paralog_samples));
+    for parsed in parsed_genes {
+        if let Some(paralog) = parsed.paralog {
+            paralogs.push(paralog);
         }
-        genes.push(build_gene(raw, &sample_indices));
+        genes.push(parsed.gene);
     }
 
     Ok(LoadedAlignments {
@@ -234,34 +167,87 @@ where
     })
 }
 
-// Converts a parsed raw alignment into the compact gene representation.
-fn build_gene(raw: RawAlignment, sample_indices: &HashMap<&str, usize>) -> Gene {
-    let global_sample_indices = raw
-        .sample_names
-        .iter()
-        .map(|sample| {
-            sample_indices
-                .get(sample.as_str())
-                .copied()
-                .expect("raw alignment sample should exist in global sample index")
-        })
-        .collect();
+// Reads only the header row of Panaroo's Rtab and returns its sample columns.
+fn read_rtab_sample_names(path: &Path) -> Result<Vec<String>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to read Panaroo Rtab '{}'", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut header = String::new();
+    let bytes = reader
+        .read_line(&mut header)
+        .with_context(|| format!("failed to read Panaroo Rtab '{}'", path.display()))?;
 
-    Gene::new(
-        raw.gene_name,
-        raw.alignment_len,
-        global_sample_indices,
-        raw.sequences,
-    )
+    if bytes == 0 {
+        bail!("Panaroo Rtab '{}' contains no header row", path.display());
+    }
+
+    parse_rtab_header(path, &header)
+}
+
+// Parses the Rtab header and preserves Panaroo's sample column order.
+fn parse_rtab_header(path: &Path, header: &str) -> Result<Vec<String>> {
+    let header = header.trim_end_matches(['\r', '\n']);
+    let columns: Vec<_> = header.split('\t').collect();
+
+    if columns.first() != Some(&"Gene") {
+        bail!(
+            "Panaroo Rtab '{}' header must start with 'Gene'",
+            path.display()
+        );
+    }
+
+    if columns.len() < 2 {
+        bail!(
+            "Panaroo Rtab '{}' header must contain at least one sample column",
+            path.display()
+        );
+    }
+
+    let sample_names: Vec<_> = columns[1..]
+        .iter()
+        .map(|sample| (*sample).to_owned())
+        .collect();
+    build_sample_indices(&sample_names, path)?;
+
+    Ok(sample_names)
+}
+
+// Builds the global sample index and rejects duplicate or empty Rtab samples.
+fn build_sample_indices<'a>(
+    sample_names: &'a [String],
+    rtab_path: &Path,
+) -> Result<HashMap<&'a str, usize>> {
+    let mut sample_indices = HashMap::with_capacity(sample_names.len());
+    for (index, sample) in sample_names.iter().enumerate() {
+        if sample.is_empty() {
+            bail!(
+                "Panaroo Rtab '{}' header contains an empty sample name",
+                rtab_path.display()
+            );
+        }
+
+        if sample_indices.insert(sample.as_str(), index).is_some() {
+            bail!(
+                "Panaroo Rtab '{}' header contains duplicate sample name '{sample}'",
+                rtab_path.display()
+            );
+        }
+    }
+
+    Ok(sample_indices)
 }
 
 // Parses one FASTA alignment and validates its records.
-fn parse_raw_alignment(path: &Path, paralog_mode: ParalogMode) -> Result<RawAlignment> {
+fn parse_gene_alignment(
+    path: &Path,
+    sample_indices: &HashMap<&str, usize>,
+    paralog_mode: ParalogMode,
+) -> Result<ParsedGene> {
     let path = path.to_path_buf();
     let gene_name = gene_name_from_path(&path)?;
     let reader = open_alignment_reader(&path)?;
     let mut reader = Reader::new(reader);
-    let mut sample_groups: Vec<RawSampleGroup> = Vec::new();
+    let mut sample_groups: Vec<SampleGroup> = Vec::new();
     let mut sample_group_indices: HashMap<String, usize> = HashMap::new();
     let mut alignment_len = None;
 
@@ -275,6 +261,13 @@ fn parse_raw_alignment(path: &Path, paralog_mode: ParalogMode) -> Result<RawAlig
                 path.display()
             )
         })?);
+
+        if !sample_indices.contains_key(sample.as_str()) {
+            bail!(
+                "sample '{sample}' in alignment '{}' does not appear in gene_presence_absence.Rtab",
+                path.display()
+            );
+        }
 
         let sequence = record.full_seq();
         let observed_len = sequence.len();
@@ -305,23 +298,18 @@ fn parse_raw_alignment(path: &Path, paralog_mode: ParalogMode) -> Result<RawAlig
             None => alignment_len = Some(observed_len),
         }
 
+        let non_gap_count = non_gap_count(&sequence);
         let sequence = sequence.into_owned();
-        let record = RawSampleRecord {
-            non_gap_count: non_gap_count(&sequence),
-            sequence,
-        };
+        let record = (sequence, non_gap_count);
 
         match sample_group_indices.entry(sample.clone()) {
             Entry::Occupied(entry) => {
-                sample_groups[*entry.get()].records.push(record);
+                sample_groups[*entry.get()].1.push(record);
             }
             Entry::Vacant(entry) => {
                 let group_index = sample_groups.len();
                 entry.insert(group_index);
-                sample_groups.push(RawSampleGroup {
-                    sample_name: sample,
-                    records: vec![record],
-                });
+                sample_groups.push((sample, vec![record]));
             }
         }
     }
@@ -332,61 +320,67 @@ fn parse_raw_alignment(path: &Path, paralog_mode: ParalogMode) -> Result<RawAlig
 
     let affected_sample_count = sample_groups
         .iter()
-        .filter(|group| group.records.len() > 1)
+        .filter(|(_, records)| records.len() > 1)
         .count();
-    let (sample_names, sequences) = resolve_paralogs(sample_groups, paralog_mode);
-
-    Ok(RawAlignment {
-        gene_name,
-        sample_names,
-        sequences,
+    let (global_sample_indices, sequences) =
+        resolve_paralogs(sample_groups, sample_indices, paralog_mode);
+    let gene = Gene::new(
+        gene_name.clone(),
         alignment_len,
-        paralog: (affected_sample_count > 0).then_some(affected_sample_count),
+        global_sample_indices,
+        sequences,
+    );
+
+    Ok(ParsedGene {
+        gene,
+        paralog: (affected_sample_count > 0).then_some((gene_name, affected_sample_count)),
     })
 }
 
 // Resolves duplicate normalized sample IDs according to the selected mode.
 fn resolve_paralogs(
-    sample_groups: Vec<RawSampleGroup>,
+    sample_groups: Vec<SampleGroup>,
+    sample_indices: &HashMap<&str, usize>,
     paralog_mode: ParalogMode,
-) -> (Vec<String>, Vec<Vec<u8>>) {
-    let mut sample_names = Vec::with_capacity(sample_groups.len());
+) -> (Vec<usize>, Vec<Vec<u8>>) {
+    let mut global_sample_indices = Vec::with_capacity(sample_groups.len());
     let mut sequences = Vec::with_capacity(sample_groups.len());
 
-    for group in sample_groups {
-        let Some(sequence) = resolve_sample_group(group.records, paralog_mode) else {
+    for (sample_name, records) in sample_groups {
+        let Some(sequence) = resolve_sample_group(records, paralog_mode) else {
             continue;
         };
 
-        sample_names.push(group.sample_name);
+        let sample_index = sample_indices
+            .get(sample_name.as_str())
+            .copied()
+            .expect("alignment sample should have been validated against Rtab header");
+        global_sample_indices.push(sample_index);
         sequences.push(sequence);
     }
 
-    (sample_names, sequences)
+    (global_sample_indices, sequences)
 }
 
 // Selects the sequence to keep for a single normalized sample group.
-fn resolve_sample_group(
-    mut records: Vec<RawSampleRecord>,
-    paralog_mode: ParalogMode,
-) -> Option<Vec<u8>> {
+fn resolve_sample_group(mut records: SampleRecords, paralog_mode: ParalogMode) -> Option<Vec<u8>> {
     debug_assert!(!records.is_empty());
 
     match paralog_mode {
-        ParalogMode::First => Some(records.remove(0).sequence),
+        ParalogMode::First => Some(records.remove(0).0),
         ParalogMode::Skip if records.len() > 1 => None,
-        ParalogMode::Skip => Some(records.remove(0).sequence),
+        ParalogMode::Skip => Some(records.remove(0).0),
         ParalogMode::Longest => {
             let mut best_index = 0;
-            let mut best_non_gap_count = records[0].non_gap_count;
+            let mut best_non_gap_count = records[0].1;
             for (index, record) in records.iter().enumerate().skip(1) {
-                if record.non_gap_count > best_non_gap_count {
+                if record.1 > best_non_gap_count {
                     best_index = index;
-                    best_non_gap_count = record.non_gap_count;
+                    best_non_gap_count = record.1;
                 }
             }
 
-            Some(records.swap_remove(best_index).sequence)
+            Some(records.swap_remove(best_index).0)
         }
     }
 }
@@ -394,6 +388,210 @@ fn resolve_sample_group(
 // Counts non-gap characters for longest-paralog resolution.
 fn non_gap_count(sequence: &[u8]) -> usize {
     sequence.iter().filter(|&&base| base != b'-').count()
+}
+
+// Drops alignments with entropy strictly greater than the requested threshold.
+fn filter_alignments_by_entropy(
+    panaroo_dir: &Path,
+    aln_paths: Vec<PathBuf>,
+    max_entropy: f64,
+) -> Result<Vec<PathBuf>> {
+    let entropy_path = panaroo_dir.join("alignment_entropy.csv");
+    let entropies = read_alignment_entropy(&entropy_path)?;
+    let mut retained = Vec::with_capacity(aln_paths.len());
+    let mut removed_count = 0;
+    let mut missing_count = 0;
+
+    for aln_path in aln_paths {
+        let gene_name = gene_name_from_path(&aln_path)?;
+        match entropies.get(&gene_name) {
+            Some(&entropy) if entropy > max_entropy => {
+                removed_count += 1;
+            }
+            Some(_) => retained.push(aln_path),
+            None => {
+                missing_count += 1;
+                retained.push(aln_path);
+            }
+        }
+    }
+
+    if missing_count > 0 {
+        log::warn!(
+            "{} alignments lacked entropy metadata in '{}'; keeping them",
+            missing_count,
+            entropy_path.display()
+        );
+    }
+    log::info!(
+        "Filtered {} alignments with entropy > {}",
+        removed_count,
+        max_entropy
+    );
+
+    Ok(retained)
+}
+
+// Reads Panaroo alignment entropy metadata keyed by normalized gene name.
+fn read_alignment_entropy(path: &Path) -> Result<HashMap<String, f64>> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read alignment entropy CSV '{}'", path.display()))?;
+    let mut lines = contents
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty());
+    let Some((header_line_number, header_line)) = lines.next() else {
+        bail!(
+            "alignment entropy CSV '{}' contains no header row",
+            path.display()
+        );
+    };
+    let header = parse_csv_record(header_line).with_context(|| {
+        format!(
+            "malformed alignment entropy CSV '{}': line {}",
+            path.display(),
+            header_line_number + 1
+        )
+    })?;
+    let (gene_column, entropy_column) = entropy_csv_columns(path, &header)?;
+    let mut entropies = HashMap::new();
+
+    for (line_number, line) in lines {
+        let fields = parse_csv_record(line).with_context(|| {
+            format!(
+                "malformed alignment entropy CSV '{}': line {}",
+                path.display(),
+                line_number + 1
+            )
+        })?;
+        if fields.len() <= gene_column.max(entropy_column) {
+            bail!(
+                "malformed alignment entropy CSV '{}': line {} has too few columns",
+                path.display(),
+                line_number + 1
+            );
+        }
+
+        let raw_gene_name = fields[gene_column].trim();
+        if raw_gene_name.is_empty() {
+            bail!(
+                "malformed alignment entropy CSV '{}': line {} has an empty gene name",
+                path.display(),
+                line_number + 1
+            );
+        }
+        let gene_name = normalize_gene_name(raw_gene_name).with_context(|| {
+            format!(
+                "malformed alignment entropy CSV '{}': line {}",
+                path.display(),
+                line_number + 1
+            )
+        })?;
+
+        let entropy = fields[entropy_column]
+            .trim()
+            .parse::<f64>()
+            .with_context(|| {
+                format!(
+                    "malformed alignment entropy CSV '{}': line {} has invalid entropy",
+                    path.display(),
+                    line_number + 1
+                )
+            })?;
+        if !entropy.is_finite() {
+            bail!(
+                "malformed alignment entropy CSV '{}': line {} has non-finite entropy",
+                path.display(),
+                line_number + 1
+            );
+        }
+
+        if entropies.insert(gene_name.clone(), entropy).is_some() {
+            bail!(
+                "malformed alignment entropy CSV '{}' contains duplicate entropy rows for gene '{}'",
+                path.display(),
+                gene_name
+            );
+        }
+    }
+
+    Ok(entropies)
+}
+
+// Finds the gene and entropy columns in the CSV header.
+fn entropy_csv_columns(path: &Path, header: &[String]) -> Result<(usize, usize)> {
+    if header.len() < 2 {
+        bail!(
+            "malformed alignment entropy CSV '{}' header must contain at least two columns",
+            path.display()
+        );
+    }
+
+    let gene_column = header
+        .iter()
+        .position(|column| normalize_csv_header(column).contains("gene"))
+        .unwrap_or(0);
+    let entropy_column = header
+        .iter()
+        .position(|column| normalize_csv_header(column).contains("entropy"))
+        .or_else(|| (header.len() == 2).then_some(1))
+        .with_context(|| {
+            format!(
+                "malformed alignment entropy CSV '{}' header does not contain an entropy column",
+                path.display()
+            )
+        })?;
+
+    if gene_column == entropy_column {
+        bail!(
+            "malformed alignment entropy CSV '{}' uses the same column for gene and entropy",
+            path.display()
+        );
+    }
+
+    Ok((gene_column, entropy_column))
+}
+
+// Normalizes header names for loose matching.
+fn normalize_csv_header(column: &str) -> String {
+    column
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+// Parses one simple CSV record, including quoted fields and escaped quotes.
+fn parse_csv_record(line: &str) -> Result<Vec<String>> {
+    let line = line.trim_end_matches('\r');
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(character) = chars.next() {
+        match character {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => {
+                in_quotes = !in_quotes;
+            }
+            ',' if !in_quotes => {
+                fields.push(field);
+                field = String::new();
+            }
+            _ => field.push(character),
+        }
+    }
+
+    if in_quotes {
+        bail!("unterminated quoted CSV field");
+    }
+
+    fields.push(field);
+    Ok(fields)
 }
 
 // Normalizes a FASTA record identifier to its sample name.
@@ -422,6 +620,14 @@ fn gene_name_from_path(path: &Path) -> Result<String> {
         bail!("alignment path has no filename: '{}'", path.display());
     };
 
+    normalize_gene_name(file_name)
+}
+
+// Derives a gene name by stripping known alignment/compression suffixes.
+fn normalize_gene_name(name: &str) -> Result<String> {
+    let Some(file_name) = Path::new(name).file_name().and_then(|name| name.to_str()) else {
+        bail!("gene name is empty");
+    };
     let mut name = file_name.to_owned();
 
     for suffix in ["gz", "bgz", "bz2", "xz", "zst"] {
@@ -433,7 +639,7 @@ fn gene_name_from_path(path: &Path) -> Result<String> {
     }
 
     if name.is_empty() {
-        bail!("alignment path has no filename: '{}'", path.display());
+        bail!("gene name is empty");
     }
 
     Ok(name)
@@ -471,9 +677,42 @@ mod tests {
         path
     }
 
+    // Writes the required Panaroo Rtab header fixture.
+    fn write_rtab(dir: &TempDir, sample_names: &[&str]) {
+        fs::write(
+            dir.path().join("gene_presence_absence.Rtab"),
+            format!("Gene\t{}\n", sample_names.join("\t")),
+        )
+        .unwrap();
+    }
+
+    // Writes an alignment under Panaroo's standard alignment directory.
+    fn write_panaroo_alignment(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
+        let alignment_dir = dir.path().join("aligned_gene_sequences");
+        fs::create_dir_all(&alignment_dir).unwrap();
+        let path = alignment_dir.join(name);
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    // Parses a temporary alignment with explicit Rtab sample names.
+    fn parse_with_samples(
+        path: &Path,
+        sample_names: &[&str],
+        paralog_mode: ParalogMode,
+    ) -> Result<ParsedGene> {
+        let sample_names: Vec<_> = sample_names
+            .iter()
+            .map(|sample| (*sample).to_owned())
+            .collect();
+        let sample_indices =
+            build_sample_indices(&sample_names, Path::new("gene_presence_absence.Rtab")).unwrap();
+        parse_gene_alignment(path, &sample_indices, paralog_mode)
+    }
+
     // Parses a temporary alignment with the default paralog behavior.
-    fn parse_default(path: &Path) -> Result<RawAlignment> {
-        parse_raw_alignment(path, ParalogMode::First)
+    fn parse_default(path: &Path) -> Result<ParsedGene> {
+        parse_with_samples(path, &["sample1", "sample2"], ParalogMode::First)
     }
 
     #[test]
@@ -486,12 +725,12 @@ mod tests {
             ">sample1\nACGT\n>sample2 description\nTGCA\n",
         );
 
-        let raw = parse_default(&path).unwrap();
-        assert_eq!(raw.gene_name, "gene");
-        assert_eq!(raw.alignment_len, 4);
-        assert_eq!(raw.paralog, None);
-        assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
-        assert_eq!(raw.sequences.len(), 2);
+        let parsed = parse_default(&path).unwrap();
+        assert_eq!(parsed.gene.name(), "gene");
+        assert_eq!(parsed.paralog, None);
+        assert_eq!(parsed.gene.sample_index(0), Some(0));
+        assert_eq!(parsed.gene.sample_index(1), Some(1));
+        assert_eq!(parsed.gene.snp_count(0, 1, false), (4, 4));
     }
 
     #[test]
@@ -500,9 +739,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(&dir, "gene.aln.fas", ">sample1\nACGT\n>sample2\nTGCA\n");
 
-        let raw = parse_default(&path).unwrap();
+        let parsed = parse_default(&path).unwrap();
 
-        assert_eq!(raw.gene_name, "gene");
+        assert_eq!(parsed.gene.name(), "gene");
     }
 
     #[test]
@@ -515,9 +754,11 @@ mod tests {
             ">cl7_bakta;4_0_1479\nACGT\n>cl3_bakta;2_1_12 description\nTGCA\n",
         );
 
-        let raw = parse_default(&path).unwrap();
+        let parsed =
+            parse_with_samples(&path, &["cl7_bakta", "cl3_bakta"], ParalogMode::First).unwrap();
 
-        assert_eq!(raw.sample_names, vec!["cl7_bakta", "cl3_bakta"]);
+        assert_eq!(parsed.gene.sample_index(0), Some(0));
+        assert_eq!(parsed.gene.sample_index(1), Some(1));
     }
 
     #[test]
@@ -527,14 +768,15 @@ mod tests {
         let path = write_alignment(
             &dir,
             "gene.aln",
-            ">sample1;first\nACGT\n>sample2\nCCCC\n>sample1;second\nTGCA\n",
+            ">sample1;first\nAAAA\n>sample2\nAAAA\n>sample1;second\nCCCC\n",
         );
 
-        let raw = parse_default(&path).unwrap();
+        let parsed = parse_default(&path).unwrap();
 
-        assert_eq!(raw.paralog, Some(1));
-        assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
-        assert_eq!(raw.sequences, vec![b"ACGT".to_vec(), b"CCCC".to_vec()]);
+        assert_eq!(parsed.paralog, Some(("gene".to_string(), 1)));
+        let sample1 = parsed.gene.sample_index(0).unwrap();
+        let sample2 = parsed.gene.sample_index(1).unwrap();
+        assert_eq!(parsed.gene.snp_count(sample1, sample2, false), (0, 4));
     }
 
     #[test]
@@ -547,11 +789,14 @@ mod tests {
             ">sample1;first\nACGT\n>sample2\nCCCC\n>sample1;second\nTGCA\n>sample3\nGGGG\n",
         );
 
-        let raw = parse_raw_alignment(&path, ParalogMode::Skip).unwrap();
+        let parsed =
+            parse_with_samples(&path, &["sample1", "sample2", "sample3"], ParalogMode::Skip)
+                .unwrap();
 
-        assert_eq!(raw.paralog, Some(1));
-        assert_eq!(raw.sample_names, vec!["sample2", "sample3"]);
-        assert_eq!(raw.sequences, vec![b"CCCC".to_vec(), b"GGGG".to_vec()]);
+        assert_eq!(parsed.paralog, Some(("gene".to_string(), 1)));
+        assert_eq!(parsed.gene.sample_index(0), None);
+        assert_eq!(parsed.gene.sample_index(1), Some(0));
+        assert_eq!(parsed.gene.sample_index(2), Some(1));
     }
 
     #[test]
@@ -561,14 +806,16 @@ mod tests {
         let path = write_alignment(
             &dir,
             "gene.aln",
-            ">sample1;short\nAA--\n>sample2\nCCCC\n>sample1;long\nA-CG\n",
+            ">sample1;short\nAA--\n>sample2\nACGT\n>sample1;long\nACGT\n",
         );
 
-        let raw = parse_raw_alignment(&path, ParalogMode::Longest).unwrap();
+        let parsed =
+            parse_with_samples(&path, &["sample1", "sample2"], ParalogMode::Longest).unwrap();
 
-        assert_eq!(raw.paralog, Some(1));
-        assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
-        assert_eq!(raw.sequences, vec![b"A-CG".to_vec(), b"CCCC".to_vec()]);
+        assert_eq!(parsed.paralog, Some(("gene".to_string(), 1)));
+        let sample1 = parsed.gene.sample_index(0).unwrap();
+        let sample2 = parsed.gene.sample_index(1).unwrap();
+        assert_eq!(parsed.gene.snp_count(sample1, sample2, true), (0, 4));
     }
 
     #[test]
@@ -578,13 +825,15 @@ mod tests {
         let path = write_alignment(
             &dir,
             "gene.aln",
-            ">sample1;first\nA--C\n>sample1;second\nG--T\n",
+            ">sample1;first\nA--C\n>sample2\nA--C\n>sample1;second\nG--T\n",
         );
 
-        let raw = parse_raw_alignment(&path, ParalogMode::Longest).unwrap();
+        let parsed =
+            parse_with_samples(&path, &["sample1", "sample2"], ParalogMode::Longest).unwrap();
 
-        assert_eq!(raw.sample_names, vec!["sample1"]);
-        assert_eq!(raw.sequences, vec![b"A--C".to_vec()]);
+        let sample1 = parsed.gene.sample_index(0).unwrap();
+        let sample2 = parsed.gene.sample_index(1).unwrap();
+        assert_eq!(parsed.gene.snp_count(sample1, sample2, true), (0, 2));
     }
 
     #[test]
@@ -597,7 +846,7 @@ mod tests {
             ">sample1;first\nACGT\n>sample1;second\nACG\n",
         );
 
-        let error = parse_raw_alignment(&path, ParalogMode::First).unwrap_err();
+        let error = parse_with_samples(&path, &["sample1"], ParalogMode::First).unwrap_err();
         assert!(
             error.to_string().contains("variable sequence lengths"),
             "error: {error}"
@@ -621,20 +870,63 @@ mod tests {
     }
 
     #[test]
+    // Verifies alignments cannot introduce samples absent from the Rtab header.
+    fn parser_rejects_unknown_sample_names() {
+        let dir = TempDir::new().unwrap();
+        let path = write_alignment(&dir, "gene.aln", ">sample1\nACGT\n>sample3\nACGT\n");
+
+        let error = parse_default(&path).unwrap_err();
+
+        assert!(
+            error.to_string().contains("does not appear"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    // Verifies zero-length FASTA records are rejected.
+    fn parser_rejects_zero_length_sequences() {
+        let dir = TempDir::new().unwrap();
+        let path = write_alignment(&dir, "gene.aln", ">sample1\n\n");
+
+        let error = parse_with_samples(&path, &["sample1"], ParalogMode::First).unwrap_err();
+
+        assert!(
+            error.to_string().contains("zero-length sequence"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
+    // Verifies empty alignments are rejected.
+    fn parser_rejects_empty_alignments() {
+        let dir = TempDir::new().unwrap();
+        let path = write_alignment(&dir, "gene.aln", "");
+
+        let error = parse_with_samples(&path, &["sample1"], ParalogMode::First).unwrap_err();
+
+        assert!(
+            error.to_string().contains("contains no FASTA records"),
+            "error: {error}"
+        );
+    }
+
+    #[test]
     // Verifies per-gene sample order is preserved independently.
     fn sample_order_can_differ_between_genes() {
         let dir = TempDir::new().unwrap();
-        let gene_a = write_alignment(&dir, "gene_a.aln", ">s1\nAAAA\n>s2\nCCCC\n");
-        let gene_b = write_alignment(&dir, "gene_b.aln", ">s2\nCCCC\n>s1\nAAAA\n");
+        write_rtab(&dir, &["s2", "s1"]);
+        write_panaroo_alignment(&dir, "gene_a.aln.fas", ">s1\nAAAA\n>s2\nCCCC\n");
+        write_panaroo_alignment(&dir, "gene_b.aln.fas", ">s2\nCCCC\n>s1\nAAAA\n");
 
-        let loaded = load_genes(&[gene_a, gene_b], ParalogMode::First, true).unwrap();
+        let loaded = load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
 
-        assert_eq!(loaded.sample_names, vec!["s1", "s2"]);
+        assert_eq!(loaded.sample_names, vec!["s2", "s1"]);
         assert_eq!(loaded.genes.len(), 2);
-        assert_eq!(loaded.genes[0].sample_index(0), Some(0));
-        assert_eq!(loaded.genes[0].sample_index(1), Some(1));
-        assert_eq!(loaded.genes[1].sample_index(1), Some(0));
-        assert_eq!(loaded.genes[1].sample_index(0), Some(1));
+        assert_eq!(loaded.genes[0].sample_index(1), Some(0));
+        assert_eq!(loaded.genes[0].sample_index(0), Some(1));
+        assert_eq!(loaded.genes[1].sample_index(0), Some(0));
+        assert_eq!(loaded.genes[1].sample_index(1), Some(1));
         assert_eq!(loaded.genes[0].snp_count(0, 1, false), (4, 4));
         assert_eq!(loaded.genes[1].snp_count(0, 1, false), (4, 4));
     }
@@ -643,18 +935,19 @@ mod tests {
     // Verifies genes may contain different subsets of samples.
     fn genes_may_have_different_sample_sets() {
         let dir = TempDir::new().unwrap();
-        let gene_a = write_alignment(
+        write_rtab(&dir, &["s1", "s2", "s3"]);
+        write_panaroo_alignment(
             &dir,
-            "gene_a.aln",
+            "gene_a.aln.fas",
             ">s1;contig_a\nAAAA\n>s2;contig_a\nCCCC\n",
         );
-        let gene_b = write_alignment(
+        write_panaroo_alignment(
             &dir,
-            "gene_b.aln",
+            "gene_b.aln.fas",
             ">s3;contig_b\nCCCC\n>s1;contig_b\nAAAA\n",
         );
 
-        let loaded = load_genes(&[gene_a, gene_b], ParalogMode::First, true).unwrap();
+        let loaded = load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
 
         assert_eq!(loaded.sample_names, vec!["s1", "s2", "s3"]);
         assert_eq!(loaded.genes.len(), 2);
@@ -665,18 +958,19 @@ mod tests {
     }
 
     #[test]
-    // Verifies load metadata records affected genes in input order.
-    fn load_genes_collects_paralog_report_rows_in_input_order() {
+    // Verifies load metadata records affected genes in sorted alignment order.
+    fn load_genes_collects_paralog_report_rows_in_alignment_order() {
         let dir = TempDir::new().unwrap();
-        let gene_a = write_alignment(
+        write_rtab(&dir, &["s1", "s2"]);
+        write_panaroo_alignment(
             &dir,
-            "gene_a.aln",
+            "gene_a.aln.fas",
             ">s1;first\nAAAA\n>s2\nCCCC\n>s1;second\nTTTT\n",
         );
-        let gene_clean = write_alignment(&dir, "gene_clean.aln", ">s1\nAAAA\n>s2\nCCCC\n");
-        let gene_b = write_alignment(
+        write_panaroo_alignment(&dir, "gene_clean.aln.fas", ">s1\nAAAA\n>s2\nCCCC\n");
+        write_panaroo_alignment(
             &dir,
-            "gene_b.aln",
+            "gene_b.aln.fas",
             concat!(
                 ">s1;first\nAAAA\n",
                 ">s2;first\nCCCC\n",
@@ -685,7 +979,7 @@ mod tests {
             ),
         );
 
-        let loaded = load_genes(&[gene_a, gene_clean, gene_b], ParalogMode::First, true).unwrap();
+        let loaded = load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
 
         assert_eq!(
             loaded.paralogs,
@@ -694,61 +988,59 @@ mod tests {
     }
 
     #[test]
-    // Verifies MSA lists ignore comments and blank lines.
-    fn parse_msa_list_ignores_blank_lines_and_comments() {
-        let observed = parse_msa_list(
-            Path::new("fixtures/list.txt"),
-            "\n  \n# comment\n  # indented comment\nalpha.aln\n\nbeta.aln\n",
-        );
+    // Verifies Rtab header parsing preserves sample column order.
+    fn parse_rtab_header_preserves_sample_order() {
+        let observed = parse_rtab_header(
+            Path::new("gene_presence_absence.Rtab"),
+            "Gene\tbeta\talpha\r\n",
+        )
+        .unwrap();
 
-        assert_eq!(
-            observed,
-            vec![
-                PathBuf::from("fixtures/alpha.aln"),
-                PathBuf::from("fixtures/beta.aln")
-            ]
-        );
+        assert_eq!(observed, vec!["beta", "alpha"]);
     }
 
     #[test]
-    // Verifies relative MSA entries are resolved against the list directory.
-    fn parse_msa_list_resolves_relative_paths_against_list_directory() {
-        let observed = parse_msa_list(
-            Path::new("data/lists/msa.txt"),
-            "../gene.aln\nnested/gene.aln",
-        );
+    // Verifies Rtab headers must start with the Gene column.
+    fn parse_rtab_header_requires_gene_first_column() {
+        let error = parse_rtab_header(Path::new("gene_presence_absence.Rtab"), "gene\talpha\n")
+            .unwrap_err();
 
-        assert_eq!(
-            observed,
-            vec![
-                PathBuf::from("data/lists/../gene.aln"),
-                PathBuf::from("data/lists/nested/gene.aln")
-            ]
-        );
+        assert!(error.to_string().contains("must start with 'Gene'"));
     }
 
     #[test]
-    // Verifies absolute MSA entries are preserved unchanged.
-    fn parse_msa_list_preserves_absolute_paths() {
-        let absolute = std::env::current_dir().unwrap().join("gene.aln");
-        let observed = parse_msa_list(Path::new("data/list.txt"), &absolute.to_string_lossy());
+    // Verifies Rtab headers must contain at least one sample column.
+    fn parse_rtab_header_requires_sample_columns() {
+        let error =
+            parse_rtab_header(Path::new("gene_presence_absence.Rtab"), "Gene\n").unwrap_err();
 
-        assert_eq!(observed, vec![absolute]);
+        assert!(error.to_string().contains("at least one sample"));
     }
 
     #[test]
-    // Verifies Panaroo discovery uses sorted top-level .aln.fas files first.
-    fn read_panaroo_dir_uses_sorted_top_level_aln_fas_files() {
+    // Verifies duplicate Rtab sample names are rejected before loading.
+    fn parse_rtab_header_rejects_duplicate_samples() {
+        let error = parse_rtab_header(
+            Path::new("gene_presence_absence.Rtab"),
+            "Gene\talpha\talpha\n",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate sample name"));
+    }
+
+    #[test]
+    // Verifies Panaroo discovery uses sorted aligned_gene_sequences .aln.fas files.
+    fn read_panaroo_dir_uses_sorted_aligned_gene_sequences_files() {
         let dir = TempDir::new().unwrap();
-        let first = dir.path().join("alpha.aln.fas");
-        let second = dir.path().join("zeta.aln.fas");
+        fs::write(dir.path().join("top_level.aln.fas"), "").unwrap();
+        let alignment_dir = dir.path().join("aligned_gene_sequences");
+        fs::create_dir(&alignment_dir).unwrap();
+        let first = alignment_dir.join("alpha.aln.fas");
+        let second = alignment_dir.join("zeta.aln.fas");
         fs::write(&second, "").unwrap();
-        fs::write(dir.path().join("ignored.fas"), "").unwrap();
+        fs::write(alignment_dir.join("ignored.fas"), "").unwrap();
         fs::write(&first, "").unwrap();
-
-        let fallback = dir.path().join("aligned_gene_sequences");
-        fs::create_dir(&fallback).unwrap();
-        fs::write(fallback.join("fallback.aln.fas"), "").unwrap();
 
         let observed = read_panaroo_dir(dir.path()).unwrap();
 
@@ -756,25 +1048,24 @@ mod tests {
     }
 
     #[test]
-    // Verifies Panaroo discovery falls back to aligned_gene_sequences.
-    fn read_panaroo_dir_falls_back_to_aligned_gene_sequences() {
+    // Verifies Panaroo discovery rejects a missing aligned_gene_sequences directory.
+    fn read_panaroo_dir_requires_aligned_gene_sequences() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("ignored.fas"), "").unwrap();
-        let fallback = dir.path().join("aligned_gene_sequences");
-        fs::create_dir(&fallback).unwrap();
-        let gene = fallback.join("gene.aln.fas");
-        fs::write(&gene, "").unwrap();
+        fs::write(dir.path().join("gene.aln.fas"), "").unwrap();
 
-        let observed = read_panaroo_dir(dir.path()).unwrap();
+        let error = read_panaroo_dir(dir.path()).unwrap_err();
 
-        assert_eq!(observed, vec![gene]);
+        assert!(
+            error.to_string().contains("aligned_gene_sequences"),
+            "error: {error}"
+        );
     }
 
     #[test]
-    // Verifies Panaroo discovery errors when neither location contains alignments.
-    fn read_panaroo_dir_rejects_empty_locations() {
+    // Verifies Panaroo discovery errors when the alignment directory is empty.
+    fn read_panaroo_dir_rejects_empty_alignment_directory() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("ignored.fas"), "").unwrap();
+        fs::create_dir(dir.path().join("aligned_gene_sequences")).unwrap();
 
         let error = read_panaroo_dir(dir.path()).unwrap_err();
 
@@ -784,6 +1075,55 @@ mod tests {
                 .contains("found no Panaroo alignment files ending in .aln.fas"),
             "error: {error}"
         );
+    }
+
+    #[test]
+    // Verifies entropy filtering uses the same gene-name normalization as alignments.
+    fn entropy_filter_matches_normalized_alignment_names() {
+        let dir = TempDir::new().unwrap();
+        let high = write_panaroo_alignment(&dir, "group_672.aln.fas", "");
+        let equal = write_panaroo_alignment(&dir, "group_equal.aln.fas", "");
+        fs::write(
+            dir.path().join("alignment_entropy.csv"),
+            "gene,entropy\ngroup_672.aln,0.51\ngroup_equal.aln,0.5\n",
+        )
+        .unwrap();
+
+        let observed =
+            filter_alignments_by_entropy(dir.path(), vec![high, equal.clone()], 0.5).unwrap();
+
+        assert_eq!(observed, vec![equal]);
+    }
+
+    #[test]
+    // Verifies alignments without entropy rows are retained.
+    fn entropy_filter_keeps_alignments_without_metadata() {
+        let dir = TempDir::new().unwrap();
+        let known = write_panaroo_alignment(&dir, "known.aln.fas", "");
+        let missing = write_panaroo_alignment(&dir, "missing.aln.fas", "");
+        fs::write(
+            dir.path().join("alignment_entropy.csv"),
+            "gene,entropy\nknown,0.1\n",
+        )
+        .unwrap();
+
+        let observed =
+            filter_alignments_by_entropy(dir.path(), vec![known.clone(), missing.clone()], 0.5)
+                .unwrap();
+
+        assert_eq!(observed, vec![known, missing]);
+    }
+
+    #[test]
+    // Verifies malformed entropy values are rejected.
+    fn read_alignment_entropy_rejects_malformed_values() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("alignment_entropy.csv");
+        fs::write(&path, "gene,entropy\ngene_a,not-a-number\n").unwrap();
+
+        let error = read_alignment_entropy(&path).unwrap_err();
+
+        assert!(error.to_string().contains("invalid entropy"));
     }
 
     #[test]
