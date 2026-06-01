@@ -5,16 +5,16 @@ const DEFAULT_A0: f64 = 9.0;
 const DEFAULT_A1: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PairGeneStats<'a> {
+pub(crate) struct PairGeneStats {
     pub(crate) gene_index: usize,
-    pub(crate) gene_id: &'a str,
+    pub(crate) gene_sort_rank: usize,
     pub(crate) snps: usize,
     pub(crate) length: usize,
 }
 
 // Selects genes above the inferred recombination threshold.
-pub(crate) fn select_recombinant_gene_indices<'a>(
-    genes: impl IntoIterator<Item = PairGeneStats<'a>>,
+pub(crate) fn select_recombinant_gene_indices(
+    genes: impl IntoIterator<Item = PairGeneStats>,
 ) -> Vec<usize> {
     let mut ordered_genes: Vec<_> = genes.into_iter().collect();
     order_pair_genes(&mut ordered_genes);
@@ -30,22 +30,22 @@ pub(crate) fn select_recombinant_gene_indices<'a>(
 }
 
 // Orders genes by divergence and deterministic tie-breakers.
-fn order_pair_genes(genes: &mut [PairGeneStats<'_>]) {
+fn order_pair_genes(genes: &mut [PairGeneStats]) {
     genes.sort_by(|left, right| {
         snp_proportion(*left)
             .total_cmp(&snp_proportion(*right))
             .then_with(|| right.length.cmp(&left.length))
-            .then_with(|| left.gene_id.cmp(right.gene_id))
+            .then_with(|| left.gene_sort_rank.cmp(&right.gene_sort_rank))
     });
 }
 
 // Computes the SNP proportion for one pairwise gene comparison.
-fn snp_proportion(gene: PairGeneStats<'_>) -> f64 {
+fn snp_proportion(gene: PairGeneStats) -> f64 {
     gene.snps as f64 / gene.length as f64
 }
 
 // Computes normalized threshold model probabilities for ordered genes.
-fn threshold_model_probabilities(ordered_genes: &[PairGeneStats<'_>]) -> Vec<f64> {
+fn threshold_model_probabilities(ordered_genes: &[PairGeneStats]) -> Vec<f64> {
     if ordered_genes.is_empty() {
         return Vec::new();
     }
@@ -147,58 +147,49 @@ mod tests {
     use super::*;
 
     // Builds pairwise gene stats for model tests.
-    fn gene(
-        gene_index: usize,
-        gene_id: &'static str,
-        snps: usize,
-        length: usize,
-    ) -> PairGeneStats<'static> {
+    fn gene(gene_index: usize, gene_sort_rank: usize, snps: usize, length: usize) -> PairGeneStats {
         PairGeneStats {
             gene_index,
-            gene_id,
+            gene_sort_rank,
             snps,
             length,
         }
     }
 
-    // Returns gene IDs after applying model ordering.
-    fn ordered_ids(mut genes: Vec<PairGeneStats<'static>>) -> Vec<&'static str> {
+    // Returns gene indices after applying model ordering.
+    fn ordered_indices(mut genes: Vec<PairGeneStats>) -> Vec<usize> {
         order_pair_genes(&mut genes);
-        genes.into_iter().map(|gene| gene.gene_id).collect()
+        genes.into_iter().map(|gene| gene.gene_index).collect()
     }
 
     #[test]
     // Verifies genes sort by increasing SNP proportion.
     fn sorts_by_increasing_snp_proportion() {
-        let observed = ordered_ids(vec![gene(0, "higher", 2, 10), gene(1, "lower", 1, 10)]);
+        let observed = ordered_indices(vec![gene(0, 0, 2, 10), gene(1, 1, 1, 10)]);
 
-        assert_eq!(observed, vec!["lower", "higher"]);
+        assert_eq!(observed, vec![1, 0]);
     }
 
     #[test]
     // Verifies equal SNP proportions prefer longer alignments.
     fn tie_breaks_by_longer_alignment_first() {
-        let observed = ordered_ids(vec![gene(0, "short", 1, 10), gene(1, "long", 2, 20)]);
+        let observed = ordered_indices(vec![gene(0, 0, 1, 10), gene(1, 1, 2, 20)]);
 
-        assert_eq!(observed, vec!["long", "short"]);
+        assert_eq!(observed, vec![1, 0]);
     }
 
     #[test]
-    // Verifies remaining ties are broken by gene identifier.
-    fn final_tie_breaker_is_gene_id() {
-        let observed = ordered_ids(vec![gene(0, "gene_b", 1, 10), gene(1, "gene_a", 1, 10)]);
+    // Verifies remaining ties are broken by precomputed gene-name sort rank.
+    fn final_tie_breaker_is_gene_sort_rank() {
+        let observed = ordered_indices(vec![gene(0, 1, 1, 10), gene(1, 0, 1, 10)]);
 
-        assert_eq!(observed, vec!["gene_a", "gene_b"]);
+        assert_eq!(observed, vec![1, 0]);
     }
 
     #[test]
     // Verifies thresholding selects the reference recombinant tail.
     fn bayesian_threshold_selects_python_reference_tail() {
-        let genes = vec![
-            gene(0, "high", 8, 10),
-            gene(1, "low", 0, 10),
-            gene(2, "middle", 1, 10),
-        ];
+        let genes = vec![gene(0, 0, 8, 10), gene(1, 1, 0, 10), gene(2, 2, 1, 10)];
 
         let observed = select_recombinant_gene_indices(genes);
 

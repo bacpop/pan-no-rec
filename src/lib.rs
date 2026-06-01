@@ -95,13 +95,13 @@ pub fn main() -> Result<()> {
     }
 
     log::info!("Running recombination detection: fitting pairwise distance models");
-    let gene_hits = compare_loaded_alignments(&sample_names, &genes, args.gaps, args.quiet);
+    let gene_hits = compare_loaded_alignments(sample_names.len(), &genes, args.gaps, args.quiet);
 
     log::info!("Running recombination detection: using graphs to find genes");
-    let table = presence_table_from_pair_hits(&sample_names, &genes, &gene_hits, args.quiet);
+    let table = presence_table_from_pair_hits(sample_names.len(), &genes, &gene_hits, args.quiet);
 
     log::info!("Writing output");
-    write_recombination_table(&table, stdout().lock())
+    write_recombination_table(&sample_names, &genes, &table, stdout().lock())
         .with_context(|| "failed to write recombination table to stdout")?;
     let end = Instant::now();
 

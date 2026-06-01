@@ -35,9 +35,8 @@ struct RawAlignment {
 }
 
 #[derive(Debug)]
-struct ProcessedAlignment {
-    gene: Gene,
-    sample_names: Vec<String>,
+struct ParsedAlignment {
+    raw: RawAlignment,
     paralog: Option<ParalogReportRow>,
 }
 
@@ -131,17 +130,25 @@ fn collect_panaroo_alignments(dir: &Path, required: bool) -> Result<Vec<PathBuf>
 
 // Writes a recombination presence table as tab-separated text.
 pub fn write_recombination_table<W: Write>(
+    sample_names: &[String],
+    genes: &[Gene],
     table: &RecombinationTable,
     mut writer: W,
 ) -> Result<()> {
     write!(writer, "gene")?;
-    for sample in &table.sample_names {
+    for sample in sample_names {
         write!(writer, "\t{sample}")?;
     }
     writeln!(writer)?;
 
     for row in &table.rows {
-        write!(writer, "{}", row.gene)?;
+        let gene = genes.get(row.gene_index).with_context(|| {
+            format!(
+                "recombination table row references missing gene index {}",
+                row.gene_index
+            )
+        })?;
+        write!(writer, "{}", gene.name())?;
         for value in &row.presence {
             write!(writer, "\t{value}")?;
         }
@@ -197,12 +204,10 @@ pub(crate) fn load_genes<P>(
 where
     P: AsRef<Path> + Sync,
 {
-    let mut genes = Vec::with_capacity(aln_paths.len());
-    let mut paralogs = Vec::new();
     let mut all_samples = HashSet::new();
 
     let pbar = get_progress_bar(aln_paths.len(), false, quiet);
-    let processed_alignments: Vec<ProcessedAlignment> = aln_paths
+    let parsed_alignments: Vec<ParsedAlignment> = aln_paths
         .par_iter()
         .progress_with(pbar)
         .map(|aln| {
@@ -211,27 +216,31 @@ where
                 gene: raw.gene_name.clone(),
                 paralog_samples: raw.paralog_sample_count,
             });
-            let sample_names = raw.sample_names.clone();
-            let gene = build_gene(raw);
 
-            Ok(ProcessedAlignment {
-                gene,
-                sample_names,
-                paralog,
-            })
+            Ok(ParsedAlignment { raw, paralog })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    for processed in processed_alignments {
-        all_samples.extend(processed.sample_names);
-        if let Some(paralog) = processed.paralog {
-            paralogs.push(paralog);
-        }
-        genes.push(processed.gene);
+    for parsed in &parsed_alignments {
+        all_samples.extend(parsed.raw.sample_names.iter().cloned());
     }
 
     let mut sample_names: Vec<_> = all_samples.into_iter().collect();
     sample_names.sort();
+    let sample_indices: HashMap<_, _> = sample_names
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| (sample.as_str(), index))
+        .collect();
+
+    let mut genes = Vec::with_capacity(parsed_alignments.len());
+    let mut paralogs = Vec::new();
+    for parsed in parsed_alignments {
+        if let Some(paralog) = parsed.paralog {
+            paralogs.push(paralog);
+        }
+        genes.push(build_gene(parsed.raw, &sample_indices));
+    }
 
     Ok(LoadedAlignments {
         sample_names,
@@ -241,11 +250,22 @@ where
 }
 
 // Converts a parsed raw alignment into the compact gene representation.
-fn build_gene(raw: RawAlignment) -> Gene {
+fn build_gene(raw: RawAlignment, sample_indices: &HashMap<&str, usize>) -> Gene {
+    let global_sample_indices = raw
+        .sample_names
+        .iter()
+        .map(|sample| {
+            sample_indices
+                .get(sample.as_str())
+                .copied()
+                .expect("raw alignment sample should exist in global sample index")
+        })
+        .collect();
+
     Gene::new(
         raw.gene_name,
         raw.alignment_len,
-        raw.sample_names,
+        global_sample_indices,
         raw.sequences,
     )
 }
@@ -626,10 +646,10 @@ mod tests {
 
         assert_eq!(loaded.sample_names, vec!["s1", "s2"]);
         assert_eq!(loaded.genes.len(), 2);
-        assert_eq!(loaded.genes[0].sample_index("s1"), Some(0));
-        assert_eq!(loaded.genes[0].sample_index("s2"), Some(1));
-        assert_eq!(loaded.genes[1].sample_index("s2"), Some(0));
-        assert_eq!(loaded.genes[1].sample_index("s1"), Some(1));
+        assert_eq!(loaded.genes[0].sample_index(0), Some(0));
+        assert_eq!(loaded.genes[0].sample_index(1), Some(1));
+        assert_eq!(loaded.genes[1].sample_index(1), Some(0));
+        assert_eq!(loaded.genes[1].sample_index(0), Some(1));
         assert_eq!(loaded.genes[0].snp_count(0, 1, false), (4, 4));
         assert_eq!(loaded.genes[1].snp_count(0, 1, false), (4, 4));
     }
@@ -653,10 +673,10 @@ mod tests {
 
         assert_eq!(loaded.sample_names, vec!["s1", "s2", "s3"]);
         assert_eq!(loaded.genes.len(), 2);
-        assert_eq!(loaded.genes[0].sample_index("s1"), Some(0));
-        assert_eq!(loaded.genes[0].sample_index("s2"), Some(1));
-        assert_eq!(loaded.genes[1].sample_index("s3"), Some(0));
-        assert_eq!(loaded.genes[1].sample_index("s1"), Some(1));
+        assert_eq!(loaded.genes[0].sample_index(0), Some(0));
+        assert_eq!(loaded.genes[0].sample_index(1), Some(1));
+        assert_eq!(loaded.genes[1].sample_index(2), Some(0));
+        assert_eq!(loaded.genes[1].sample_index(0), Some(1));
     }
 
     #[test]
@@ -793,22 +813,36 @@ mod tests {
     #[test]
     // Verifies recombination tables are emitted as expected TSV.
     fn write_recombination_table_emits_tsv() {
+        let sample_names = vec!["alpha".to_string(), "beta".to_string()];
+        let genes = vec![
+            Gene::new(
+                "gene1".to_string(),
+                1,
+                vec![0, 1],
+                vec![b"A".to_vec(), b"A".to_vec()],
+            ),
+            Gene::new(
+                "gene2".to_string(),
+                1,
+                vec![0, 1],
+                vec![b"A".to_vec(), b"A".to_vec()],
+            ),
+        ];
         let table = RecombinationTable {
-            sample_names: vec!["alpha".to_string(), "beta".to_string()],
             rows: vec![
                 crate::graph::RecombinationRow {
-                    gene: "gene1".to_string(),
+                    gene_index: 0,
                     presence: vec![1, 0],
                 },
                 crate::graph::RecombinationRow {
-                    gene: "gene2".to_string(),
+                    gene_index: 1,
                     presence: vec![0, 1],
                 },
             ],
         };
         let mut output = Vec::new();
 
-        write_recombination_table(&table, &mut output).unwrap();
+        write_recombination_table(&sample_names, &genes, &table, &mut output).unwrap();
 
         assert_eq!(
             String::from_utf8(output).unwrap(),

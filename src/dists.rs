@@ -5,12 +5,12 @@ use hashbrown::HashMap;
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 
-pub type PairHits = HashMap<String, Vec<(String, String)>>;
-type SamplePair = (String, String);
+pub type PairHits = HashMap<usize, Vec<(usize, usize)>>;
+type SamplePair = (usize, usize);
 
 // Runs pairwise comparison across all sample pairs for loaded genes.
 pub fn compare_loaded_alignments(
-    sample_names: &[String],
+    sample_count: usize,
     genes: &[Gene],
     gaps: bool,
     quiet: bool,
@@ -19,29 +19,42 @@ pub fn compare_loaded_alignments(
     // range. That gives Rayon similarly sized units of work for each sample pair,
     // instead of parallelizing only by the outer sample index where early rows are
     // much larger than later rows.
-    let sample_pair_count = sample_pair_count(sample_names.len());
+    let gene_sort_ranks = gene_sort_ranks(genes);
+    let sample_pair_count = sample_pair_count(sample_count);
     let progress_bar = get_progress_bar(sample_pair_count, true, quiet);
     let gene_pair_hits: Vec<_> = (0..sample_pair_count)
         .into_par_iter()
         .progress_with(progress_bar)
         .flat_map_iter(|pair_offset| {
-            let (sample_a, sample_b) = sample_pair_indices(sample_names.len(), pair_offset);
-            selected_pair_hits(
-                genes,
-                &sample_names[sample_a],
-                &sample_names[sample_b],
-                gaps,
-            )
+            let (sample_a, sample_b) = sample_pair_indices(sample_count, pair_offset);
+            selected_pair_hits(genes, &gene_sort_ranks, sample_a, sample_b, gaps)
         })
         .collect();
 
-    // Convert to a hash map, include genes with no hits
+    // Convert to a hash map keyed by global gene index.
     let mut hits: PairHits = HashMap::new();
     for (gene, pair) in gene_pair_hits {
         hits.entry(gene).or_default().push(pair);
     }
 
     hits
+}
+
+// Computes each gene's lexicographic sort rank by gene name.
+fn gene_sort_ranks(genes: &[Gene]) -> Vec<usize> {
+    let mut ordered_indices: Vec<_> = (0..genes.len()).collect();
+    ordered_indices.sort_by(|&left, &right| {
+        genes[left]
+            .name()
+            .cmp(genes[right].name())
+            .then_with(|| left.cmp(&right))
+    });
+
+    let mut ranks = vec![0; genes.len()];
+    for (rank, gene_index) in ordered_indices.into_iter().enumerate() {
+        ranks[gene_index] = rank;
+    }
+    ranks
 }
 
 // Counts unique unordered sample pairs.
@@ -83,27 +96,30 @@ fn pairs_before_sample(sample_count: usize, sample_index: usize) -> usize {
 // Selects recombinant genes for one sample pair and tags them with that pair.
 fn selected_pair_hits(
     genes: &[Gene],
-    sample_a: &str,
-    sample_b: &str,
+    gene_sort_ranks: &[usize],
+    sample_a: usize,
+    sample_b: usize,
     gaps: bool,
-) -> Vec<(String, SamplePair)> {
-    let pair_genes = collect_comparable_pair_gene_stats(genes, sample_a, sample_b, gaps);
-    let recombinant_gene_indices = select_recombinant_gene_indices(pair_genes.clone());
-    let pair = (sample_a.to_owned(), sample_b.to_owned());
+) -> Vec<(usize, SamplePair)> {
+    let pair_genes =
+        collect_comparable_pair_gene_stats(genes, gene_sort_ranks, sample_a, sample_b, gaps);
+    let recombinant_gene_indices = select_recombinant_gene_indices(pair_genes);
+    let pair = (sample_a, sample_b);
 
     recombinant_gene_indices
         .into_iter()
-        .map(|gene_index| (genes[gene_index].name().to_owned(), pair.clone()))
+        .map(|gene_index| (gene_index, pair))
         .collect()
 }
 
 // Collects SNP and length statistics for genes containing both samples.
-fn collect_comparable_pair_gene_stats<'a>(
-    genes: &'a [Gene],
-    sample_a: &str,
-    sample_b: &str,
+fn collect_comparable_pair_gene_stats(
+    genes: &[Gene],
+    gene_sort_ranks: &[usize],
+    sample_a: usize,
+    sample_b: usize,
     gaps: bool,
-) -> Vec<PairGeneStats<'a>> {
+) -> Vec<PairGeneStats> {
     genes
         .iter()
         .enumerate()
@@ -118,7 +134,7 @@ fn collect_comparable_pair_gene_stats<'a>(
 
             Some(PairGeneStats {
                 gene_index,
-                gene_id: gene.name(),
+                gene_sort_rank: gene_sort_ranks[gene_index],
                 snps,
                 length,
             })
@@ -142,7 +158,7 @@ mod tests {
     {
         let loaded =
             load_genes(aln_paths, ParalogMode::First, true).expect("Test gene load failed");
-        let hits = compare_loaded_alignments(&loaded.sample_names, &loaded.genes, false, true);
+        let hits = compare_loaded_alignments(loaded.sample_names.len(), &loaded.genes, false, true);
         (loaded.sample_names, loaded.genes, hits)
     }
 
@@ -158,7 +174,7 @@ mod tests {
         P: AsRef<Path> + Sync,
     {
         let (sample_names, genes, hits) = compare_alignments(aln_paths);
-        presence_table_from_pair_hits(&sample_names, &genes, &hits, true)
+        presence_table_from_pair_hits(sample_names.len(), &genes, &hits, true)
     }
 
     // Writes a temporary FASTA alignment for tests.
@@ -199,14 +215,13 @@ mod tests {
 
         let mut hits = compare_alignments(&paths);
         sort_pair_hits(&mut hits.2);
-        let mut observed: Vec<_> = hits.2.keys().cloned().collect();
+        let mut observed: Vec<_> = hits.2.keys().copied().collect();
         observed.sort();
 
-        let expected: Vec<_> = (8..12).map(|index| format!("gene{index:02}")).collect();
-        assert_eq!(observed, expected);
+        assert_eq!(observed, vec![8, 9, 10, 11]);
 
         for pairs in hits.2.values() {
-            assert_eq!(pairs, &vec![("s1".to_string(), "s2".to_string())]);
+            assert_eq!(pairs, &vec![(0, 1)]);
         }
     }
 
@@ -240,14 +255,13 @@ mod tests {
 
         let mut hits = compare_alignments(&paths);
         sort_pair_hits(&mut hits.2);
-        let mut observed: Vec<_> = hits.2.keys().cloned().collect();
+        let mut observed: Vec<_> = hits.2.keys().copied().collect();
         observed.sort();
 
-        let expected: Vec<_> = (8..12).map(|index| format!("gene{index:02}")).collect();
-        assert_eq!(observed, expected);
+        assert_eq!(observed, vec![8, 9, 10, 11]);
 
         for pairs in hits.2.values() {
-            assert_eq!(pairs, &vec![("alpha".to_string(), "beta".to_string())]);
+            assert_eq!(pairs, &vec![(0, 1)]);
         }
     }
 
@@ -260,14 +274,15 @@ mod tests {
         let gene_bg = write_alignment(&dir, "gene_bg.aln", ">beta\nCCCC\n>gamma\nTTTT\n");
         let loaded =
             crate::io::load_genes(&[gene_ab, gene_ag, gene_bg], ParalogMode::First, true).unwrap();
+        let gene_sort_ranks = gene_sort_ranks(&loaded.genes);
 
         let observed: Vec<_> =
-            collect_comparable_pair_gene_stats(&loaded.genes, "alpha", "beta", false)
+            collect_comparable_pair_gene_stats(&loaded.genes, &gene_sort_ranks, 0, 1, false)
                 .into_iter()
-                .map(|stats| stats.gene_id)
+                .map(|stats| stats.gene_index)
                 .collect();
 
-        assert_eq!(observed, vec!["gene_ab"]);
+        assert_eq!(observed, vec![0]);
     }
 
     #[test]
@@ -280,23 +295,24 @@ mod tests {
         let loaded =
             crate::io::load_genes(&[zero_length, positive_length], ParalogMode::First, true)
                 .unwrap();
+        let gene_sort_ranks = gene_sort_ranks(&loaded.genes);
 
         let observed: Vec<_> =
-            collect_comparable_pair_gene_stats(&loaded.genes, "alpha", "beta", false)
+            collect_comparable_pair_gene_stats(&loaded.genes, &gene_sort_ranks, 0, 1, false)
                 .into_iter()
-                .map(|stats| (stats.gene_id, stats.snps, stats.length))
+                .map(|stats| (stats.gene_index, stats.snps, stats.length))
                 .collect();
 
-        assert_eq!(observed, vec![("gene_positive", 1, 4)]);
+        assert_eq!(observed, vec![(1, 1, 4)]);
 
-        let hits = compare_loaded_alignments(&loaded.sample_names, &loaded.genes, false, true);
+        let hits = compare_loaded_alignments(loaded.sample_names.len(), &loaded.genes, false, true);
 
-        assert!(!hits.contains_key("gene_zero"));
+        assert!(!hits.contains_key(&0));
     }
 
     #[test]
-    // Verifies presence output keeps gene order and sorted sample columns.
-    fn presence_table_keeps_all_input_genes_in_order_with_sorted_samples() {
+    // Verifies presence output keeps gene order.
+    fn presence_table_keeps_all_input_genes_in_order() {
         let dir = TempDir::new().unwrap();
         let paths = [
             write_alignment(
@@ -318,20 +334,19 @@ mod tests {
 
         let table = infer_recombination_presence(&paths);
 
-        assert_eq!(table.sample_names, vec!["alpha", "beta"]);
         assert_eq!(
             table.rows,
             vec![
                 RecombinationRow {
-                    gene: "gene_low".to_string(),
+                    gene_index: 0,
                     presence: vec![0, 0],
                 },
                 RecombinationRow {
-                    gene: "gene_middle".to_string(),
+                    gene_index: 1,
                     presence: vec![0, 0],
                 },
                 RecombinationRow {
-                    gene: "gene_high".to_string(),
+                    gene_index: 2,
                     presence: vec![0, 0],
                 },
             ]

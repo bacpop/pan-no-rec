@@ -99,24 +99,24 @@ impl SampleBases {
 pub(crate) struct Gene {
     name: String,
     alignment_len: usize,
-    sample_indices: HashMap<String, usize>,
+    sample_indices: HashMap<usize, usize>,
     samples: Vec<SampleBases>,
 }
 
 impl Gene {
-    // Builds a gene from ordered sample names and aligned sequences.
+    // Builds a gene from ordered global sample indices and aligned sequences.
     pub(crate) fn new(
         name: String,
         alignment_len: usize,
-        sample_names: Vec<String>,
+        global_sample_indices: Vec<usize>,
         ordered_sequences: Vec<Vec<u8>>,
     ) -> Self {
-        debug_assert_eq!(sample_names.len(), ordered_sequences.len());
+        debug_assert_eq!(global_sample_indices.len(), ordered_sequences.len());
 
-        let sample_indices = sample_names
-            .iter()
+        let sample_indices = global_sample_indices
+            .into_iter()
             .enumerate()
-            .map(|(index, sample)| (sample.clone(), index))
+            .map(|(local_index, global_index)| (global_index, local_index))
             .collect();
         let samples = ordered_sequences
             .iter()
@@ -160,9 +160,9 @@ impl Gene {
         &self.name
     }
 
-    // Looks up the internal index for a sample name.
-    pub(crate) fn sample_index(&self, sample: &str) -> Option<usize> {
-        self.sample_indices.get(sample).copied()
+    // Looks up the internal sequence index for a global sample index.
+    pub(crate) fn sample_index(&self, global_sample_index: usize) -> Option<usize> {
+        self.sample_indices.get(&global_sample_index).copied()
     }
 }
 
@@ -175,7 +175,7 @@ mod tests {
         Gene::new(
             "gene".to_string(),
             sequence_a.len(),
-            vec!["sample_a".to_string(), "sample_b".to_string()],
+            vec![0, 1],
             vec![sequence_a.to_vec(), sequence_b.to_vec()],
         )
     }
@@ -201,6 +201,21 @@ mod tests {
         assert_eq!(bases.g.contains(0), expected_g, "{} G", base as char);
         assert_eq!(bases.t.contains(0), expected_t, "{} T", base as char);
         assert_eq!(bases.gap.contains(0), expected_gap, "{} gap", base as char);
+    }
+
+    #[test]
+    // Verifies sample lookup maps global sample indices to local sequence indices.
+    fn sample_lookup_uses_global_sample_indices() {
+        let gene = Gene::new(
+            "gene".to_string(),
+            4,
+            vec![3, 1],
+            vec![b"AAAA".to_vec(), b"CCCC".to_vec()],
+        );
+
+        assert_eq!(gene.sample_index(3), Some(0));
+        assert_eq!(gene.sample_index(1), Some(1));
+        assert_eq!(gene.sample_index(0), None);
     }
 
     #[test]

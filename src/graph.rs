@@ -11,59 +11,43 @@ type RecombinationGraph = UnGraph<usize, ()>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecombinationTable {
-    pub sample_names: Vec<String>,
     pub rows: Vec<RecombinationRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecombinationRow {
-    pub gene: String,
+    pub gene_index: usize,
     pub presence: Vec<u8>,
 }
 
 // Builds the public presence table from pairwise recombinant hits.
 pub fn presence_table_from_pair_hits(
-    sample_names: &[String],
+    sample_count: usize,
     genes: &[Gene],
     hits: &PairHits,
     quiet: bool,
 ) -> RecombinationTable {
-    let sample_indices: HashMap<_, _> = sample_names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (name.as_str(), index))
-        .collect();
     let progress_bar = get_progress_bar(genes.len(), false, quiet);
     let rows = genes
         .par_iter()
+        .enumerate()
         .progress_with(progress_bar)
-        .map(|gene| {
-            let pairs = hits.get(gene.name()).map(Vec::as_slice).unwrap_or(&[]);
+        .map(|(gene_index, _)| {
+            let pairs = hits.get(&gene_index).map(Vec::as_slice).unwrap_or(&[]);
 
             RecombinationRow {
-                gene: gene.name().to_owned(),
-                presence: crate::graph::infer_gene_presence(
-                    &sample_indices,
-                    sample_names.len(),
-                    pairs,
-                ),
+                gene_index,
+                presence: crate::graph::infer_gene_presence(sample_count, pairs),
             }
         })
         .collect();
 
-    RecombinationTable {
-        sample_names: sample_names.to_vec(),
-        rows,
-    }
+    RecombinationTable { rows }
 }
 
 // Infers sample-level recombination presence from pairwise gene hits.
-pub(crate) fn infer_gene_presence(
-    sample_indices: &HashMap<&str, usize>,
-    sample_count: usize,
-    pairs: &[(String, String)],
-) -> Vec<u8> {
-    let graph = recombinant_pair_graph(sample_indices, pairs);
+pub(crate) fn infer_gene_presence(sample_count: usize, pairs: &[(usize, usize)]) -> Vec<u8> {
+    let graph = recombinant_pair_graph(sample_count, pairs);
     let mut presence = vec![0; sample_count];
 
     for sample_index in prune_recombinant_samples(&graph) {
@@ -74,22 +58,12 @@ pub(crate) fn infer_gene_presence(
 }
 
 // Builds an undirected graph whose edges are recombinant sample pairs.
-fn recombinant_pair_graph(
-    sample_indices: &HashMap<&str, usize>,
-    pairs: &[(String, String)],
-) -> RecombinationGraph {
+fn recombinant_pair_graph(sample_count: usize, pairs: &[(usize, usize)]) -> RecombinationGraph {
     let mut graph = RecombinationGraph::default();
     let mut sample_nodes = HashMap::new();
 
-    for (left, right) in pairs {
-        let Some(left_index) = sample_indices.get(left.as_str()).copied() else {
-            continue;
-        };
-        let Some(right_index) = sample_indices.get(right.as_str()).copied() else {
-            continue;
-        };
-
-        if left_index == right_index {
+    for &(left_index, right_index) in pairs {
+        if left_index >= sample_count || right_index >= sample_count || left_index == right_index {
             continue;
         }
 
@@ -313,19 +287,9 @@ mod tests {
         samples
     }
 
-    // Runs presence inference from compact sample and pair fixtures.
-    fn presence_for_pairs(samples: &[&str], pairs: &[(&str, &str)]) -> Vec<u8> {
-        let sample_indices: HashMap<_, _> = samples
-            .iter()
-            .enumerate()
-            .map(|(index, sample)| (*sample, index))
-            .collect();
-        let pairs: Vec<_> = pairs
-            .iter()
-            .map(|(left, right)| (left.to_string(), right.to_string()))
-            .collect();
-
-        infer_gene_presence(&sample_indices, samples.len(), &pairs)
+    // Runs presence inference from sample-index pair fixtures.
+    fn presence_for_pairs(sample_count: usize, pairs: &[(usize, usize)]) -> Vec<u8> {
+        infer_gene_presence(sample_count, pairs)
     }
 
     #[test]
@@ -375,10 +339,7 @@ mod tests {
     #[test]
     // Verifies small initial graphs do not mark recombination presence.
     fn pruning_skips_initial_graphs_with_at_most_three_nodes() {
-        let observed = presence_for_pairs(
-            &["alpha", "beta", "gamma", "delta"],
-            &[("alpha", "beta"), ("beta", "gamma")],
-        );
+        let observed = presence_for_pairs(4, &[(0, 1), (1, 2)]);
 
         assert_eq!(observed, vec![0, 0, 0, 0]);
     }
@@ -386,10 +347,7 @@ mod tests {
     #[test]
     // Verifies a dominant hub is marked without marking its leaves.
     fn hub_degree_more_than_three_times_second_highest_marks_only_hub() {
-        let observed = presence_for_pairs(
-            &["hub", "s1", "s2", "s3", "s4"],
-            &[("hub", "s1"), ("hub", "s2"), ("hub", "s3"), ("hub", "s4")],
-        );
+        let observed = presence_for_pairs(5, &[(0, 1), (0, 2), (0, 3), (0, 4)]);
 
         assert_eq!(observed, vec![1, 0, 0, 0, 0]);
     }
@@ -397,10 +355,7 @@ mod tests {
     #[test]
     // Verifies regular dense structure marks all remaining nodes.
     fn regular_graph_marks_all_remaining_nodes() {
-        let observed = presence_for_pairs(
-            &["s0", "s1", "s2", "s3"],
-            &[("s0", "s1"), ("s1", "s2"), ("s2", "s3"), ("s3", "s0")],
-        );
+        let observed = presence_for_pairs(4, &[(0, 1), (1, 2), (2, 3), (3, 0)]);
 
         assert_eq!(observed, vec![1, 1, 1, 1]);
     }
@@ -408,17 +363,16 @@ mod tests {
     #[test]
     // Verifies pruning stops once three or fewer nodes remain.
     fn pruning_stops_when_removals_leave_at_most_three_nodes() {
-        let observed = presence_for_pairs(
-            &["s0", "s1", "s2", "s3", "tail"],
-            &[
-                ("s0", "s1"),
-                ("s1", "s2"),
-                ("s2", "s3"),
-                ("s3", "s0"),
-                ("s3", "tail"),
-            ],
-        );
+        let observed = presence_for_pairs(5, &[(0, 1), (1, 2), (2, 3), (3, 0), (3, 4)]);
 
         assert_eq!(observed, vec![1, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    // Verifies invalid and self-pair edges are skipped defensively.
+    fn invalid_and_self_pairs_are_ignored() {
+        let observed = presence_for_pairs(4, &[(0, 0), (0, 4), (4, 1), (0, 1), (1, 2)]);
+
+        assert_eq!(observed, vec![0, 0, 0, 0]);
     }
 }
