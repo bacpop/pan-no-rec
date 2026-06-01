@@ -1,7 +1,6 @@
 use crate::cli::ParalogMode;
 use crate::gene::Gene;
 use crate::get_progress_bar;
-use crate::graph::RecombinationTable;
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use indicatif::ParallelProgressIterator;
@@ -16,13 +15,7 @@ use std::path::{Path, PathBuf};
 pub(crate) struct LoadedAlignments {
     pub(crate) sample_names: Vec<String>,
     pub(crate) genes: Vec<Gene>,
-    pub(crate) paralogs: Vec<ParalogReportRow>,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct ParalogReportRow {
-    pub(crate) gene: String,
-    pub(crate) paralog_samples: usize,
+    pub(crate) paralogs: Vec<(String, usize)>,
 }
 
 #[derive(Debug)]
@@ -31,13 +24,13 @@ struct RawAlignment {
     sample_names: Vec<String>,
     sequences: Vec<Vec<u8>>,
     alignment_len: usize,
-    paralog_sample_count: usize,
+    paralog: Option<usize>,
 }
 
-#[derive(Debug)]
-struct ParsedAlignment {
-    raw: RawAlignment,
-    paralog: Option<ParalogReportRow>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecombinationRow {
+    pub(crate) gene_index: usize,
+    pub(crate) presence: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -124,7 +117,7 @@ fn collect_panaroo_alignments(dir: &Path, required: bool) -> Result<Vec<PathBuf>
         }
     }
 
-    paths.sort();
+    paths.sort_unstable();
     Ok(paths)
 }
 
@@ -132,7 +125,7 @@ fn collect_panaroo_alignments(dir: &Path, required: bool) -> Result<Vec<PathBuf>
 pub fn write_recombination_table<W: Write>(
     sample_names: &[String],
     genes: &[Gene],
-    table: &RecombinationTable,
+    rows: &[RecombinationRow],
     mut writer: W,
 ) -> Result<()> {
     write!(writer, "gene")?;
@@ -141,7 +134,7 @@ pub fn write_recombination_table<W: Write>(
     }
     writeln!(writer)?;
 
-    for row in &table.rows {
+    for row in rows {
         let gene = genes.get(row.gene_index).with_context(|| {
             format!(
                 "recombination table row references missing gene index {}",
@@ -159,14 +152,14 @@ pub fn write_recombination_table<W: Write>(
 }
 
 // Writes per-gene paralog metadata as tab-separated text.
-pub(crate) fn write_paralog_report(path: &Path, rows: &[ParalogReportRow]) -> Result<()> {
+pub(crate) fn write_paralog_report(path: &Path, rows: &[(String, usize)]) -> Result<()> {
     let mut writer = File::create(path)
         .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
 
     writeln!(writer, "gene\tparalog_samples")
         .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
-    for row in rows {
-        writeln!(writer, "{}\t{}", row.gene, row.paralog_samples)
+    for (gene, paralog_samples) in rows {
+        writeln!(writer, "{gene}\t{paralog_samples}")
             .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
     }
 
@@ -207,39 +200,31 @@ where
     let mut all_samples = HashSet::new();
 
     let pbar = get_progress_bar(aln_paths.len(), false, quiet);
-    let parsed_alignments: Vec<ParsedAlignment> = aln_paths
+    let raw_alignments: Vec<RawAlignment> = aln_paths
         .par_iter()
         .progress_with(pbar)
-        .map(|aln| {
-            let raw = parse_raw_alignment(aln.as_ref(), paralog_mode)?;
-            let paralog = (raw.paralog_sample_count > 0).then(|| ParalogReportRow {
-                gene: raw.gene_name.clone(),
-                paralog_samples: raw.paralog_sample_count,
-            });
-
-            Ok(ParsedAlignment { raw, paralog })
-        })
+        .map(|aln| parse_raw_alignment(aln.as_ref(), paralog_mode))
         .collect::<Result<Vec<_>>>()?;
 
-    for parsed in &parsed_alignments {
-        all_samples.extend(parsed.raw.sample_names.iter().cloned());
+    for raw in &raw_alignments {
+        all_samples.extend(raw.sample_names.iter().cloned());
     }
 
     let mut sample_names: Vec<_> = all_samples.into_iter().collect();
-    sample_names.sort();
+    sample_names.sort_unstable();
     let sample_indices: HashMap<_, _> = sample_names
         .iter()
         .enumerate()
         .map(|(index, sample)| (sample.as_str(), index))
         .collect();
 
-    let mut genes = Vec::with_capacity(parsed_alignments.len());
+    let mut genes = Vec::with_capacity(raw_alignments.len());
     let mut paralogs = Vec::new();
-    for parsed in parsed_alignments {
-        if let Some(paralog) = parsed.paralog {
-            paralogs.push(paralog);
+    for raw in raw_alignments {
+        if let Some(paralog_samples) = raw.paralog {
+            paralogs.push((raw.gene_name.clone(), paralog_samples));
         }
-        genes.push(build_gene(parsed.raw, &sample_indices));
+        genes.push(build_gene(raw, &sample_indices));
     }
 
     Ok(LoadedAlignments {
@@ -356,7 +341,7 @@ fn parse_raw_alignment(path: &Path, paralog_mode: ParalogMode) -> Result<RawAlig
         sample_names,
         sequences,
         alignment_len,
-        paralog_sample_count: affected_sample_count,
+        paralog: (affected_sample_count > 0).then_some(affected_sample_count),
     })
 }
 
@@ -504,7 +489,7 @@ mod tests {
         let raw = parse_default(&path).unwrap();
         assert_eq!(raw.gene_name, "gene");
         assert_eq!(raw.alignment_len, 4);
-        assert_eq!(raw.paralog_sample_count, 0);
+        assert_eq!(raw.paralog, None);
         assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
         assert_eq!(raw.sequences.len(), 2);
     }
@@ -547,7 +532,7 @@ mod tests {
 
         let raw = parse_default(&path).unwrap();
 
-        assert_eq!(raw.paralog_sample_count, 1);
+        assert_eq!(raw.paralog, Some(1));
         assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
         assert_eq!(raw.sequences, vec![b"ACGT".to_vec(), b"CCCC".to_vec()]);
     }
@@ -564,7 +549,7 @@ mod tests {
 
         let raw = parse_raw_alignment(&path, ParalogMode::Skip).unwrap();
 
-        assert_eq!(raw.paralog_sample_count, 1);
+        assert_eq!(raw.paralog, Some(1));
         assert_eq!(raw.sample_names, vec!["sample2", "sample3"]);
         assert_eq!(raw.sequences, vec![b"CCCC".to_vec(), b"GGGG".to_vec()]);
     }
@@ -581,7 +566,7 @@ mod tests {
 
         let raw = parse_raw_alignment(&path, ParalogMode::Longest).unwrap();
 
-        assert_eq!(raw.paralog_sample_count, 1);
+        assert_eq!(raw.paralog, Some(1));
         assert_eq!(raw.sample_names, vec!["sample1", "sample2"]);
         assert_eq!(raw.sequences, vec![b"A-CG".to_vec(), b"CCCC".to_vec()]);
     }
@@ -704,16 +689,7 @@ mod tests {
 
         assert_eq!(
             loaded.paralogs,
-            vec![
-                ParalogReportRow {
-                    gene: "gene_a".to_string(),
-                    paralog_samples: 1,
-                },
-                ParalogReportRow {
-                    gene: "gene_b".to_string(),
-                    paralog_samples: 2,
-                },
-            ]
+            vec![("gene_a".to_string(), 1), ("gene_b".to_string(), 2)]
         );
     }
 
@@ -828,21 +804,19 @@ mod tests {
                 vec![b"A".to_vec(), b"A".to_vec()],
             ),
         ];
-        let table = RecombinationTable {
-            rows: vec![
-                crate::graph::RecombinationRow {
-                    gene_index: 0,
-                    presence: vec![1, 0],
-                },
-                crate::graph::RecombinationRow {
-                    gene_index: 1,
-                    presence: vec![0, 1],
-                },
-            ],
-        };
+        let rows = vec![
+            RecombinationRow {
+                gene_index: 0,
+                presence: vec![1, 0],
+            },
+            RecombinationRow {
+                gene_index: 1,
+                presence: vec![0, 1],
+            },
+        ];
         let mut output = Vec::new();
 
-        write_recombination_table(&sample_names, &genes, &table, &mut output).unwrap();
+        write_recombination_table(&sample_names, &genes, &rows, &mut output).unwrap();
 
         assert_eq!(
             String::from_utf8(output).unwrap(),

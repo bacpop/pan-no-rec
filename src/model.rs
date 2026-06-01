@@ -31,7 +31,7 @@ pub(crate) fn select_recombinant_gene_indices(
 
 // Orders genes by divergence and deterministic tie-breakers.
 fn order_pair_genes(genes: &mut [PairGeneStats]) {
-    genes.sort_by(|left, right| {
+    genes.sort_unstable_by(|left, right| {
         snp_proportion(*left)
             .total_cmp(&snp_proportion(*right))
             .then_with(|| right.length.cmp(&left.length))

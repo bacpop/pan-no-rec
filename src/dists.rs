@@ -146,7 +146,7 @@ fn collect_comparable_pair_gene_stats(
 mod tests {
     use super::*;
     use crate::cli::ParalogMode;
-    use crate::graph::{RecombinationRow, RecombinationTable};
+    use crate::io::RecombinationRow;
     use crate::{load_genes, presence_table_from_pair_hits};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -169,7 +169,7 @@ mod tests {
         }
     }
 
-    fn infer_recombination_presence<P>(aln_paths: &[P]) -> RecombinationTable
+    fn infer_recombination_presence<P>(aln_paths: &[P]) -> Vec<RecombinationRow>
     where
         P: AsRef<Path> + Sync,
     {
@@ -332,10 +332,10 @@ mod tests {
             ),
         ];
 
-        let table = infer_recombination_presence(&paths);
+        let rows = infer_recombination_presence(&paths);
 
         assert_eq!(
-            table.rows,
+            rows,
             vec![
                 RecombinationRow {
                     gene_index: 0,

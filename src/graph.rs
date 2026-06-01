@@ -6,19 +6,9 @@ use rayon::prelude::*;
 
 use crate::dists::PairHits;
 use crate::gene::Gene;
+use crate::io::RecombinationRow;
 
 type RecombinationGraph = UnGraph<usize, ()>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecombinationTable {
-    pub rows: Vec<RecombinationRow>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecombinationRow {
-    pub gene_index: usize,
-    pub presence: Vec<u8>,
-}
 
 // Builds the public presence table from pairwise recombinant hits.
 pub fn presence_table_from_pair_hits(
@@ -26,9 +16,9 @@ pub fn presence_table_from_pair_hits(
     genes: &[Gene],
     hits: &PairHits,
     quiet: bool,
-) -> RecombinationTable {
+) -> Vec<RecombinationRow> {
     let progress_bar = get_progress_bar(genes.len(), false, quiet);
-    let rows = genes
+    genes
         .par_iter()
         .enumerate()
         .progress_with(progress_bar)
@@ -37,12 +27,10 @@ pub fn presence_table_from_pair_hits(
 
             RecombinationRow {
                 gene_index,
-                presence: crate::graph::infer_gene_presence(sample_count, pairs),
+                presence: infer_gene_presence(sample_count, pairs),
             }
         })
-        .collect();
-
-    RecombinationTable { rows }
+        .collect()
 }
 
 // Infers sample-level recombination presence from pairwise gene hits.

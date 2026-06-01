@@ -98,10 +98,10 @@ pub fn main() -> Result<()> {
     let gene_hits = compare_loaded_alignments(sample_names.len(), &genes, args.gaps, args.quiet);
 
     log::info!("Running recombination detection: using graphs to find genes");
-    let table = presence_table_from_pair_hits(sample_names.len(), &genes, &gene_hits, args.quiet);
+    let rows = presence_table_from_pair_hits(sample_names.len(), &genes, &gene_hits, args.quiet);
 
     log::info!("Writing output");
-    write_recombination_table(&sample_names, &genes, &table, stdout().lock())
+    write_recombination_table(&sample_names, &genes, &rows, stdout().lock())
         .with_context(|| "failed to write recombination table to stdout")?;
     let end = Instant::now();
 
