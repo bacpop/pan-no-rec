@@ -112,6 +112,10 @@ fn collect_comparable_pair_gene_stats<'a>(
             let sample_b_index = gene.sample_index(sample_b)?;
 
             let (snps, length) = gene.snp_count(sample_a_index, sample_b_index, gaps);
+            if length == 0 {
+                return None;
+            }
+
             Some(PairGeneStats {
                 gene_index,
                 gene_id: gene.name(),
@@ -264,6 +268,30 @@ mod tests {
                 .collect();
 
         assert_eq!(observed, vec!["gene_ab"]);
+    }
+
+    #[test]
+    // Verifies zero-length effective comparisons do not reach the model fit.
+    fn comparable_pair_stats_skip_zero_length_alignments() {
+        let dir = TempDir::new().unwrap();
+        let zero_length = write_alignment(&dir, "gene_zero.aln", ">alpha\n----\n>beta\nAAAA\n");
+        let positive_length =
+            write_alignment(&dir, "gene_positive.aln", ">alpha\nAAAA\n>beta\nAAAT\n");
+        let loaded =
+            crate::io::load_genes(&[zero_length, positive_length], ParalogMode::First, true)
+                .unwrap();
+
+        let observed: Vec<_> =
+            collect_comparable_pair_gene_stats(&loaded.genes, "alpha", "beta", false)
+                .into_iter()
+                .map(|stats| (stats.gene_id, stats.snps, stats.length))
+                .collect();
+
+        assert_eq!(observed, vec![("gene_positive", 1, 4)]);
+
+        let hits = compare_loaded_alignments(&loaded.sample_names, &loaded.genes, false, true);
+
+        assert!(!hits.contains_key("gene_zero"));
     }
 
     #[test]
