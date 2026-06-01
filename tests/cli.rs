@@ -154,8 +154,8 @@ fn cli_paralog_mode_first_and_longest_affect_output() {
 }
 
 #[test]
-// Verifies skip mode removes duplicated samples from the affected alignment.
-fn cli_paralog_mode_skip_removes_duplicated_samples() {
+// Verifies skip mode removes paralogous alignments at load time.
+fn cli_paralog_mode_skip_filters_paralogous_alignments() {
     let dir = TempDir::new().unwrap();
     write_rtab(&dir, &["alpha", "beta"]);
     write_alignment(
@@ -163,10 +163,11 @@ fn cli_paralog_mode_skip_removes_duplicated_samples() {
         "gene_dup.aln.fas",
         ">alpha;first\nAAAA\n>beta\nAAAA\n>alpha;second\nCCCC\n",
     );
+    write_alignment(&dir, "gene_clean.aln.fas", ">alpha\nAAAA\n>beta\nAAAA\n");
 
     let observed = stdout_from_success(run_cli_with_paralog_mode(dir.path(), "skip"));
 
-    assert_eq!(observed, "gene\talpha\tbeta\ngene_dup\t0\t0\n");
+    assert_eq!(observed, "gene\talpha\tbeta\ngene_clean\t0\t0\n");
 }
 
 #[test]

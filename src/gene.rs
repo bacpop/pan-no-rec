@@ -148,13 +148,25 @@ impl Gene {
         (length - matches.len() as usize, length)
     }
 
+    pub(crate) fn has_sample(&self, global_sample_index: usize) -> bool {
+        self.sequences.contains_key(&global_sample_index)
+    }
+
+    pub(crate) fn has_samples(&self, sample_a: usize, sample_b: usize) -> bool {
+        self.has_sample(sample_a) && self.has_sample(sample_b)
+    }
+
     // Returns the gene identifier.
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
     pub(crate) fn paralog_count(&self) -> Option<usize> {
-        if self.paralog_count == 0 { None } else { Some(self.paralog_count) }
+        if self.paralog_count == 0 {
+            None
+        } else {
+            Some(self.paralog_count)
+        }
     }
 }
 
@@ -164,12 +176,12 @@ mod tests {
 
     // Builds a two-sample test gene from byte sequences.
     fn gene(sequence_a: &[u8], sequence_b: &[u8]) -> Gene {
-        Gene::new(
-            "gene".to_string(),
-            sequence_a.len(),
-            vec![0, 1],
-            vec![sequence_a.to_vec(), sequence_b.to_vec()],
-        )
+        let sequences = HashMap::from([
+            (0, SampleBases::from_sequence(sequence_a)),
+            (1, SampleBases::from_sequence(sequence_b)),
+        ]);
+
+        Gene::new("gene".to_string(), sequence_a.len(), sequences, 0)
     }
 
     // Counts SNPs for a single-base two-sample gene using default gap handling.
@@ -196,18 +208,19 @@ mod tests {
     }
 
     #[test]
-    // Verifies sample lookup maps global sample indices to local sequence indices.
-    fn sample_lookup_uses_global_sample_indices() {
-        let gene = Gene::new(
-            "gene".to_string(),
-            4,
-            vec![3, 1],
-            vec![b"AAAA".to_vec(), b"CCCC".to_vec()],
-        );
+    // Verifies sample presence is keyed by global sample indices.
+    fn sample_presence_uses_global_sample_indices() {
+        let sequences = HashMap::from([
+            (3, SampleBases::from_sequence(b"AAAA")),
+            (1, SampleBases::from_sequence(b"CCCC")),
+        ]);
+        let gene = Gene::new("gene".to_string(), 4, sequences, 0);
 
-        assert_eq!(gene.sample_index(3), Some(0));
-        assert_eq!(gene.sample_index(1), Some(1));
-        assert_eq!(gene.sample_index(0), None);
+        assert!(gene.has_sample(3));
+        assert!(gene.has_sample(1));
+        assert!(gene.has_samples(3, 1));
+        assert!(!gene.has_sample(0));
+        assert!(!gene.has_samples(3, 0));
     }
 
     #[test]

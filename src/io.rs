@@ -3,10 +3,10 @@ use crate::gene::{Gene, SampleBases};
 use crate::get_progress_bar;
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
+use hashbrown::{HashMap, hash_map::Entry};
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use seq_io::fasta::{Reader, Record};
-use hashbrown::{HashMap, hash_map::Entry};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -105,22 +105,30 @@ pub fn write_recombination_table<W: Write>(
 }
 
 // Writes per-gene paralog metadata as tab-separated text.
-pub(crate) fn write_paralog_report(path: &Path, genes: &[Gene]) -> Result<(usize)> {
+pub(crate) fn write_paralog_report(path: &Path, genes: &[Gene]) -> Result<usize> {
+    let paralog_rows: Vec<_> = genes
+        .iter()
+        .filter_map(|gene| {
+            gene.paralog_count()
+                .map(|paralog_count| (gene.name(), paralog_count))
+        })
+        .collect();
+
+    if paralog_rows.is_empty() {
+        return Ok(0);
+    }
+
     let mut writer = File::create(path)
         .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
 
-    let mut paralogs = 0;
     writeln!(writer, "gene\tparalog_samples")
         .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
-    for gene in genes {
-        if let Some(paralog_count) = gene.paralog_count() {
-            writeln!(writer, "{}\t{paralog_count}", gene.name())
-                .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
-            paralogs += 1;
-        }
+    for (gene_name, paralog_count) in &paralog_rows {
+        writeln!(writer, "{gene_name}\t{paralog_count}")
+            .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
     }
 
-    Ok(paralogs)
+    Ok(paralog_rows.len())
 }
 
 // Loads all Panaroo alignments into genes using the Rtab header sample order.
@@ -132,22 +140,20 @@ pub(crate) fn load_genes(
 ) -> Result<LoadedAlignments> {
     let rtab_path = panaroo_dir.join("gene_presence_absence.Rtab");
     let sample_names = read_rtab_sample_names(&rtab_path)?;
-    let sample_indices = build_sample_indices(&sample_names, &rtab_path)?;
-    let mut aln_paths = read_panaroo_dir(panaroo_dir)?;
-    if let Some(threshold) = max_entropy {
-        aln_paths = filter_alignments_by_entropy(panaroo_dir, aln_paths, threshold)?;
-    }
+    let genes = {
+        let sample_indices = build_sample_indices(&sample_names, &rtab_path)?;
+        let mut aln_paths = read_panaroo_dir(panaroo_dir)?;
+        if let Some(threshold) = max_entropy {
+            aln_paths = filter_alignments_by_entropy(panaroo_dir, aln_paths, threshold)?;
+        }
 
-    let pbar = get_progress_bar(aln_paths.len(), false, quiet);
-    let mut genes: Vec<Gene> = aln_paths
-        .par_iter()
-        .progress_with(pbar)
-        .map(|aln| parse_gene_alignment(aln, &sample_indices, paralog_mode))
-        .collect::<Result<Vec<_>>>()?;
-
-    if paralog_mode == ParalogMode::Skip {
-        genes = genes.into_iter().filter(|gene| gene.paralog_count().is_none()).collect();
-    }
+        let pbar = get_progress_bar(aln_paths.len(), false, quiet);
+        aln_paths
+            .par_iter()
+            .progress_with(pbar)
+            .map(|aln| parse_gene_alignment(aln, &sample_indices, paralog_mode))
+            .collect::<Result<Vec<_>>>()?
+    };
 
     Ok(LoadedAlignments {
         sample_names,
@@ -289,11 +295,20 @@ fn parse_gene_alignment(
 
         match parsed_sequences.entry(global_sample_index) {
             Entry::Occupied(mut entry) => {
-                paralog_counts.entry(global_sample_index).and_modify(|cnt| { *cnt + 1; }).or_insert(1);
+                paralog_counts
+                    .entry(global_sample_index)
+                    .and_modify(|cnt| {
+                        *cnt += 1;
+                    })
+                    .or_insert(1);
                 match paralog_mode {
-                    ParalogMode::First | ParalogMode::Skip => { continue; },
+                    ParalogMode::First | ParalogMode::Skip => {
+                        continue;
+                    }
                     ParalogMode::Longest => {
-                        if entry.get().non_gap_count(observed_len) < new_sequence.non_gap_count(observed_len) {
+                        if entry.get().non_gap_count(observed_len)
+                            < new_sequence.non_gap_count(observed_len)
+                        {
                             entry.insert(new_sequence);
                         }
                     }
@@ -310,12 +325,18 @@ fn parse_gene_alignment(
     };
 
     let paralog_count = paralog_counts.values().sum();
+    if paralog_count > 0 && paralog_mode == ParalogMode::Skip {
+        for sample_index in paralog_counts.keys() {
+            parsed_sequences.remove(sample_index);
+        }
+    }
 
-    Ok(Gene::new(gene_name.clone(),
-    alignment_len,
-    parsed_sequences,
-    paralog_count))
-
+    Ok(Gene::new(
+        gene_name,
+        alignment_len,
+        parsed_sequences,
+        paralog_count,
+    ))
 }
 
 // Drops alignments with entropy strictly greater than the requested threshold.
@@ -627,7 +648,7 @@ mod tests {
         path: &Path,
         sample_names: &[&str],
         paralog_mode: ParalogMode,
-    ) -> Result<ParsedGene> {
+    ) -> Result<Gene> {
         let sample_names: Vec<_> = sample_names
             .iter()
             .map(|sample| (*sample).to_owned())
@@ -638,7 +659,7 @@ mod tests {
     }
 
     // Parses a temporary alignment with the default paralog behavior.
-    fn parse_default(path: &Path) -> Result<ParsedGene> {
+    fn parse_default(path: &Path) -> Result<Gene> {
         parse_with_samples(path, &["sample1", "sample2"], ParalogMode::First)
     }
 
@@ -652,12 +673,12 @@ mod tests {
             ">sample1\nACGT\n>sample2 description\nTGCA\n",
         );
 
-        let parsed = parse_default(&path).unwrap();
-        assert_eq!(parsed.gene.name(), "gene");
-        assert_eq!(parsed.paralog, None);
-        assert_eq!(parsed.gene.sample_index(0), Some(0));
-        assert_eq!(parsed.gene.sample_index(1), Some(1));
-        assert_eq!(parsed.gene.snp_count(0, 1, false), (4, 4));
+        let gene = parse_default(&path).unwrap();
+        assert_eq!(gene.name(), "gene");
+        assert_eq!(gene.paralog_count(), None);
+        assert!(gene.has_sample(0));
+        assert!(gene.has_sample(1));
+        assert_eq!(gene.snp_count(0, 1, false), (4, 4));
     }
 
     #[test]
@@ -666,9 +687,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(&dir, "gene.aln.fas", ">sample1\nACGT\n>sample2\nTGCA\n");
 
-        let parsed = parse_default(&path).unwrap();
+        let gene = parse_default(&path).unwrap();
 
-        assert_eq!(parsed.gene.name(), "gene");
+        assert_eq!(gene.name(), "gene");
     }
 
     #[test]
@@ -681,11 +702,11 @@ mod tests {
             ">cl7_bakta;4_0_1479\nACGT\n>cl3_bakta;2_1_12 description\nTGCA\n",
         );
 
-        let parsed =
+        let gene =
             parse_with_samples(&path, &["cl7_bakta", "cl3_bakta"], ParalogMode::First).unwrap();
 
-        assert_eq!(parsed.gene.sample_index(0), Some(0));
-        assert_eq!(parsed.gene.sample_index(1), Some(1));
+        assert!(gene.has_sample(0));
+        assert!(gene.has_sample(1));
     }
 
     #[test]
@@ -698,17 +719,15 @@ mod tests {
             ">sample1;first\nAAAA\n>sample2\nAAAA\n>sample1;second\nCCCC\n",
         );
 
-        let parsed = parse_default(&path).unwrap();
+        let gene = parse_default(&path).unwrap();
 
-        assert_eq!(parsed.paralog, Some(("gene".to_string(), 1)));
-        let sample1 = parsed.gene.sample_index(0).unwrap();
-        let sample2 = parsed.gene.sample_index(1).unwrap();
-        assert_eq!(parsed.gene.snp_count(sample1, sample2, false), (0, 4));
+        assert_eq!(gene.paralog_count(), Some(1));
+        assert_eq!(gene.snp_count(0, 1, false), (0, 4));
     }
 
     #[test]
-    // Verifies skip mode removes duplicated samples from that gene.
-    fn parser_skip_mode_removes_duplicated_samples() {
+    // Verifies skip mode marks duplicated samples for load-time filtering.
+    fn parser_skip_mode_marks_duplicated_samples() {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(
             &dir,
@@ -716,14 +735,13 @@ mod tests {
             ">sample1;first\nACGT\n>sample2\nCCCC\n>sample1;second\nTGCA\n>sample3\nGGGG\n",
         );
 
-        let parsed =
-            parse_with_samples(&path, &["sample1", "sample2", "sample3"], ParalogMode::Skip)
-                .unwrap();
+        let gene = parse_with_samples(&path, &["sample1", "sample2", "sample3"], ParalogMode::Skip)
+            .unwrap();
 
-        assert_eq!(parsed.paralog, Some(("gene".to_string(), 1)));
-        assert_eq!(parsed.gene.sample_index(0), None);
-        assert_eq!(parsed.gene.sample_index(1), Some(0));
-        assert_eq!(parsed.gene.sample_index(2), Some(1));
+        assert_eq!(gene.paralog_count(), Some(1));
+        assert!(gene.has_sample(0));
+        assert!(gene.has_sample(1));
+        assert!(gene.has_sample(2));
     }
 
     #[test]
@@ -736,13 +754,11 @@ mod tests {
             ">sample1;short\nAA--\n>sample2\nACGT\n>sample1;long\nACGT\n",
         );
 
-        let parsed =
+        let gene =
             parse_with_samples(&path, &["sample1", "sample2"], ParalogMode::Longest).unwrap();
 
-        assert_eq!(parsed.paralog, Some(("gene".to_string(), 1)));
-        let sample1 = parsed.gene.sample_index(0).unwrap();
-        let sample2 = parsed.gene.sample_index(1).unwrap();
-        assert_eq!(parsed.gene.snp_count(sample1, sample2, true), (0, 4));
+        assert_eq!(gene.paralog_count(), Some(1));
+        assert_eq!(gene.snp_count(0, 1, true), (0, 4));
     }
 
     #[test]
@@ -755,12 +771,10 @@ mod tests {
             ">sample1;first\nA--C\n>sample2\nA--C\n>sample1;second\nG--T\n",
         );
 
-        let parsed =
+        let gene =
             parse_with_samples(&path, &["sample1", "sample2"], ParalogMode::Longest).unwrap();
 
-        let sample1 = parsed.gene.sample_index(0).unwrap();
-        let sample2 = parsed.gene.sample_index(1).unwrap();
-        assert_eq!(parsed.gene.snp_count(sample1, sample2, true), (0, 2));
+        assert_eq!(gene.snp_count(0, 1, true), (0, 2));
     }
 
     #[test]
@@ -862,13 +876,13 @@ mod tests {
         let loaded = load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
 
         assert_eq!(loaded.sample_names, vec!["s2", "s1"]);
-        assert_eq!(loaded.genes.len(), 2);
-        assert_eq!(loaded.genes[0].sample_index(1), Some(0));
-        assert_eq!(loaded.genes[0].sample_index(0), Some(1));
-        assert_eq!(loaded.genes[1].sample_index(0), Some(0));
-        assert_eq!(loaded.genes[1].sample_index(1), Some(1));
-        assert_eq!(loaded.genes[0].snp_count(0, 1, false), (4, 4));
-        assert_eq!(loaded.genes[1].snp_count(0, 1, false), (4, 4));
+        assert_eq!(loaded.gene_sequences.len(), 2);
+        assert!(loaded.gene_sequences[0].has_sample(1));
+        assert!(loaded.gene_sequences[0].has_sample(0));
+        assert!(loaded.gene_sequences[1].has_sample(0));
+        assert!(loaded.gene_sequences[1].has_sample(1));
+        assert_eq!(loaded.gene_sequences[0].snp_count(0, 1, false), (4, 4));
+        assert_eq!(loaded.gene_sequences[1].snp_count(0, 1, false), (4, 4));
     }
 
     #[test]
@@ -890,16 +904,18 @@ mod tests {
         let loaded = load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
 
         assert_eq!(loaded.sample_names, vec!["s1", "s2", "s3"]);
-        assert_eq!(loaded.genes.len(), 2);
-        assert_eq!(loaded.genes[0].sample_index(0), Some(0));
-        assert_eq!(loaded.genes[0].sample_index(1), Some(1));
-        assert_eq!(loaded.genes[1].sample_index(2), Some(0));
-        assert_eq!(loaded.genes[1].sample_index(0), Some(1));
+        assert_eq!(loaded.gene_sequences.len(), 2);
+        assert!(loaded.gene_sequences[0].has_sample(0));
+        assert!(loaded.gene_sequences[0].has_sample(1));
+        assert!(!loaded.gene_sequences[0].has_sample(2));
+        assert!(loaded.gene_sequences[1].has_sample(2));
+        assert!(loaded.gene_sequences[1].has_sample(0));
+        assert!(!loaded.gene_sequences[1].has_sample(1));
     }
 
     #[test]
-    // Verifies load metadata records affected genes in sorted alignment order.
-    fn load_genes_collects_paralog_report_rows_in_alignment_order() {
+    // Verifies loaded genes retain paralog metadata in sorted alignment order.
+    fn load_genes_records_paralog_counts_in_alignment_order() {
         let dir = TempDir::new().unwrap();
         write_rtab(&dir, &["s1", "s2"]);
         write_panaroo_alignment(
@@ -920,11 +936,38 @@ mod tests {
         );
 
         let loaded = load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
+        let observed: Vec<_> = loaded
+            .gene_sequences
+            .iter()
+            .filter_map(|gene| {
+                gene.paralog_count()
+                    .map(|paralog_count| (gene.name().to_owned(), paralog_count))
+            })
+            .collect();
 
         assert_eq!(
-            loaded.paralogs,
+            observed,
             vec![("gene_a".to_string(), 1), ("gene_b".to_string(), 2)]
         );
+    }
+
+    #[test]
+    // Verifies skip mode filters out genes with any paralog at load time.
+    fn load_genes_skip_mode_filters_paralogous_genes() {
+        let dir = TempDir::new().unwrap();
+        write_rtab(&dir, &["s1", "s2"]);
+        write_panaroo_alignment(
+            &dir,
+            "gene_dup.aln.fas",
+            ">s1;first\nAAAA\n>s2\nCCCC\n>s1;second\nTTTT\n",
+        );
+        write_panaroo_alignment(&dir, "gene_clean.aln.fas", ">s1\nAAAA\n>s2\nCCCC\n");
+
+        let loaded = load_genes(dir.path(), ParalogMode::Skip, None, true).unwrap();
+
+        assert_eq!(loaded.gene_sequences.len(), 1);
+        assert_eq!(loaded.gene_sequences[0].name(), "gene_clean");
+        assert_eq!(loaded.gene_sequences[0].paralog_count(), None);
     }
 
     #[test]
@@ -1074,14 +1117,20 @@ mod tests {
             Gene::new(
                 "gene1".to_string(),
                 1,
-                vec![0, 1],
-                vec![b"A".to_vec(), b"A".to_vec()],
+                HashMap::from([
+                    (0, SampleBases::from_sequence(b"A")),
+                    (1, SampleBases::from_sequence(b"A")),
+                ]),
+                0,
             ),
             Gene::new(
                 "gene2".to_string(),
                 1,
-                vec![0, 1],
-                vec![b"A".to_vec(), b"A".to_vec()],
+                HashMap::from([
+                    (0, SampleBases::from_sequence(b"A")),
+                    (1, SampleBases::from_sequence(b"A")),
+                ]),
+                0,
             ),
         ];
         let rows = vec![

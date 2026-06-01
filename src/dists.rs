@@ -124,10 +124,11 @@ fn collect_comparable_pair_gene_stats(
         .iter()
         .enumerate()
         .filter_map(|(gene_index, gene)| {
-            let sample_a_index = gene.sample_index(sample_a)?;
-            let sample_b_index = gene.sample_index(sample_b)?;
+            if !gene.has_samples(sample_a, sample_b) {
+                return None;
+            }
 
-            let (snps, length) = gene.snp_count(sample_a_index, sample_b_index, gaps);
+            let (snps, length) = gene.snp_count(sample_a, sample_b, gaps);
             if length == 0 {
                 return None;
             }
@@ -155,8 +156,13 @@ mod tests {
     fn compare_alignments(panaroo_dir: &Path) -> (Vec<String>, Vec<Gene>, PairHits) {
         let loaded =
             load_genes(panaroo_dir, ParalogMode::First, None, true).expect("Test gene load failed");
-        let hits = compare_loaded_alignments(loaded.sample_names.len(), &loaded.genes, false, true);
-        (loaded.sample_names, loaded.genes, hits)
+        let hits = compare_loaded_alignments(
+            loaded.sample_names.len(),
+            &loaded.gene_sequences,
+            false,
+            true,
+        );
+        (loaded.sample_names, loaded.gene_sequences, hits)
     }
 
     // Normalizes Rayon-collected hit order for tests that compare pair vectors.
@@ -166,7 +172,7 @@ mod tests {
         }
     }
 
-    fn infer_recombination_presence(panaroo_dir: &Path) -> Vec<RecombinationRow> {
+    fn infer_recombination_presence(panaroo_dir: &Path) -> Vec<OutputRow> {
         let (sample_names, genes, hits) = compare_alignments(panaroo_dir);
         presence_table_from_pair_hits(sample_names.len(), &genes, &hits, true)
     }
@@ -271,13 +277,18 @@ mod tests {
         write_alignment(&dir, "gene_ag.aln.fas", ">alpha\nAAAA\n>gamma\nTTTT\n");
         write_alignment(&dir, "gene_bg.aln.fas", ">beta\nCCCC\n>gamma\nTTTT\n");
         let loaded = crate::io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
-        let gene_sort_ranks = gene_sort_ranks(&loaded.genes);
+        let gene_sort_ranks = gene_sort_ranks(&loaded.gene_sequences);
 
-        let observed: Vec<_> =
-            collect_comparable_pair_gene_stats(&loaded.genes, &gene_sort_ranks, 0, 1, false)
-                .into_iter()
-                .map(|stats| stats.gene_index)
-                .collect();
+        let observed: Vec<_> = collect_comparable_pair_gene_stats(
+            &loaded.gene_sequences,
+            &gene_sort_ranks,
+            0,
+            1,
+            false,
+        )
+        .into_iter()
+        .map(|stats| stats.gene_index)
+        .collect();
 
         assert_eq!(observed, vec![0]);
     }
@@ -290,17 +301,27 @@ mod tests {
         write_alignment(&dir, "gene_zero.aln.fas", ">alpha\n----\n>beta\nAAAA\n");
         write_alignment(&dir, "gene_positive.aln.fas", ">alpha\nAAAA\n>beta\nAAAT\n");
         let loaded = crate::io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
-        let gene_sort_ranks = gene_sort_ranks(&loaded.genes);
+        let gene_sort_ranks = gene_sort_ranks(&loaded.gene_sequences);
 
-        let observed: Vec<_> =
-            collect_comparable_pair_gene_stats(&loaded.genes, &gene_sort_ranks, 0, 1, false)
-                .into_iter()
-                .map(|stats| (stats.gene_index, stats.snps, stats.length))
-                .collect();
+        let observed: Vec<_> = collect_comparable_pair_gene_stats(
+            &loaded.gene_sequences,
+            &gene_sort_ranks,
+            0,
+            1,
+            false,
+        )
+        .into_iter()
+        .map(|stats| (stats.gene_index, stats.snps, stats.length))
+        .collect();
 
         assert_eq!(observed, vec![(0, 1, 4)]);
 
-        let hits = compare_loaded_alignments(loaded.sample_names.len(), &loaded.genes, false, true);
+        let hits = compare_loaded_alignments(
+            loaded.sample_names.len(),
+            &loaded.gene_sequences,
+            false,
+            true,
+        );
 
         assert!(!hits.contains_key(&1));
     }
@@ -331,15 +352,15 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                RecombinationRow {
+                OutputRow {
                     gene_index: 0,
                     presence: vec![0, 0],
                 },
-                RecombinationRow {
+                OutputRow {
                     gene_index: 1,
                     presence: vec![0, 0],
                 },
-                RecombinationRow {
+                OutputRow {
                     gene_index: 2,
                     presence: vec![0, 0],
                 },

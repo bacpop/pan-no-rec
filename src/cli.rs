@@ -6,8 +6,11 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub(crate) enum ParalogMode {
+    /// Take the first paralog sequence
     First,
+    /// Skip any paralogs entirely
     Skip,
+    /// Take the sequence with the fewest gaps
     Longest,
 }
 
