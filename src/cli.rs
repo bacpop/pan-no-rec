@@ -33,24 +33,29 @@ impl fmt::Display for ParalogMode {
 #[derive(Debug, Parser)]
 #[command(version, about = "Find recombination from pangenome alignments")]
 pub(crate) struct Args {
+    /// Directory with panaroo output
     #[arg(long, value_name = "DIR")]
     pub panaroo_dir: PathBuf,
 
+    /// Filter alignments above a certain entropy
     #[arg(long, value_name = "FLOAT", value_parser = parse_max_entropy)]
     pub max_entropy: Option<f64>,
 
-    #[arg(long, default_value_t = 1, value_parser = parse_threads)]
-    pub threads: usize,
-
+    /// How to handle duplicated genes
     #[arg(long, value_enum, default_value_t = ParalogMode::First)]
     pub paralog_mode: ParalogMode,
 
+    /// Location to write report on paralogs
     #[arg(long, value_name = "PATH", default_value = "paralogs.txt")]
     pub paralog_report: PathBuf,
 
     /// Include gaps as SNPs
     #[arg(long, default_value_t = false)]
     pub gaps: bool,
+
+    /// CPU threads to use
+    #[arg(long, default_value_t = 1, value_parser = parse_threads)]
+    pub threads: usize,
 
     /// Show progress messages
     #[arg(short, long, global = true)]
