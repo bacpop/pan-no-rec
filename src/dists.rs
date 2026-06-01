@@ -146,7 +146,7 @@ fn collect_comparable_pair_gene_stats(
 mod tests {
     use super::*;
     use crate::cli::ParalogMode;
-    use crate::io::RecombinationRow;
+    use crate::io::OutputRow;
     use crate::{load_genes, presence_table_from_pair_hits};
     use std::fs;
     use std::path::{Path, PathBuf};

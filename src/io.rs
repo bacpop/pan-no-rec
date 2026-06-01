@@ -1,12 +1,12 @@
 use crate::cli::ParalogMode;
-use crate::gene::Gene;
+use crate::gene::{Gene, SampleBases};
 use crate::get_progress_bar;
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use seq_io::fasta::{Reader, Record};
-use std::collections::{HashMap, hash_map::Entry};
+use hashbrown::{HashMap, hash_map::Entry};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,24 +14,14 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub(crate) struct LoadedAlignments {
     pub(crate) sample_names: Vec<String>,
-    pub(crate) genes: Vec<Gene>,
-    pub(crate) paralogs: Vec<(String, usize)>,
+    pub(crate) gene_sequences: Vec<Gene>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RecombinationRow {
+pub(crate) struct OutputRow {
     pub(crate) gene_index: usize,
     pub(crate) presence: Vec<u8>,
 }
-
-#[derive(Debug)]
-struct ParsedGene {
-    gene: Gene,
-    paralog: Option<(String, usize)>,
-}
-
-type SampleRecords = Vec<(Vec<u8>, usize)>;
-type SampleGroup = (String, SampleRecords);
 
 // Finds Panaroo gene alignment files in the standard alignment directory.
 pub fn read_panaroo_dir(path: &Path) -> Result<Vec<PathBuf>> {
@@ -88,7 +78,7 @@ fn collect_panaroo_alignments(dir: &Path) -> Result<Vec<PathBuf>> {
 pub fn write_recombination_table<W: Write>(
     sample_names: &[String],
     genes: &[Gene],
-    rows: &[RecombinationRow],
+    rows: &[OutputRow],
     mut writer: W,
 ) -> Result<()> {
     write!(writer, "gene")?;
@@ -115,18 +105,22 @@ pub fn write_recombination_table<W: Write>(
 }
 
 // Writes per-gene paralog metadata as tab-separated text.
-pub(crate) fn write_paralog_report(path: &Path, rows: &[(String, usize)]) -> Result<()> {
+pub(crate) fn write_paralog_report(path: &Path, genes: &[Gene]) -> Result<(usize)> {
     let mut writer = File::create(path)
         .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
 
+    let mut paralogs = 0;
     writeln!(writer, "gene\tparalog_samples")
         .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
-    for (gene, paralog_samples) in rows {
-        writeln!(writer, "{gene}\t{paralog_samples}")
-            .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
+    for gene in genes {
+        if let Some(paralog_count) = gene.paralog_count() {
+            writeln!(writer, "{}\t{paralog_count}", gene.name())
+                .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
+            paralogs += 1;
+        }
     }
 
-    Ok(())
+    Ok(paralogs)
 }
 
 // Loads all Panaroo alignments into genes using the Rtab header sample order.
@@ -145,25 +139,19 @@ pub(crate) fn load_genes(
     }
 
     let pbar = get_progress_bar(aln_paths.len(), false, quiet);
-    let parsed_genes: Vec<ParsedGene> = aln_paths
+    let mut genes: Vec<Gene> = aln_paths
         .par_iter()
         .progress_with(pbar)
         .map(|aln| parse_gene_alignment(aln, &sample_indices, paralog_mode))
         .collect::<Result<Vec<_>>>()?;
 
-    let mut genes = Vec::with_capacity(parsed_genes.len());
-    let mut paralogs = Vec::new();
-    for parsed in parsed_genes {
-        if let Some(paralog) = parsed.paralog {
-            paralogs.push(paralog);
-        }
-        genes.push(parsed.gene);
+    if paralog_mode == ParalogMode::Skip {
+        genes = genes.into_iter().filter(|gene| gene.paralog_count().is_none()).collect();
     }
 
     Ok(LoadedAlignments {
         sample_names,
-        genes,
-        paralogs,
+        gene_sequences: genes,
     })
 }
 
@@ -242,13 +230,13 @@ fn parse_gene_alignment(
     path: &Path,
     sample_indices: &HashMap<&str, usize>,
     paralog_mode: ParalogMode,
-) -> Result<ParsedGene> {
+) -> Result<Gene> {
     let path = path.to_path_buf();
     let gene_name = gene_name_from_path(&path)?;
     let reader = open_alignment_reader(&path)?;
     let mut reader = Reader::new(reader);
-    let mut sample_groups: Vec<SampleGroup> = Vec::new();
-    let mut sample_group_indices: HashMap<String, usize> = HashMap::new();
+    let mut parsed_sequences: HashMap<usize, SampleBases> = HashMap::new();
+    let mut paralog_counts: HashMap<usize, usize> = HashMap::new();
     let mut alignment_len = None;
 
     while let Some(record) = reader.next() {
@@ -261,13 +249,12 @@ fn parse_gene_alignment(
                 path.display()
             )
         })?);
-
-        if !sample_indices.contains_key(sample.as_str()) {
+        let Some(&global_sample_index) = sample_indices.get(sample) else {
             bail!(
                 "sample '{sample}' in alignment '{}' does not appear in gene_presence_absence.Rtab",
                 path.display()
             );
-        }
+        };
 
         let sequence = record.full_seq();
         let observed_len = sequence.len();
@@ -298,18 +285,22 @@ fn parse_gene_alignment(
             None => alignment_len = Some(observed_len),
         }
 
-        let non_gap_count = non_gap_count(&sequence);
-        let sequence = sequence.into_owned();
-        let record = (sequence, non_gap_count);
+        let new_sequence = SampleBases::from_sequence(sequence.as_ref());
 
-        match sample_group_indices.entry(sample.clone()) {
-            Entry::Occupied(entry) => {
-                sample_groups[*entry.get()].1.push(record);
+        match parsed_sequences.entry(global_sample_index) {
+            Entry::Occupied(mut entry) => {
+                paralog_counts.entry(global_sample_index).and_modify(|cnt| { *cnt + 1; }).or_insert(1);
+                match paralog_mode {
+                    ParalogMode::First | ParalogMode::Skip => { continue; },
+                    ParalogMode::Longest => {
+                        if entry.get().non_gap_count(observed_len) < new_sequence.non_gap_count(observed_len) {
+                            entry.insert(new_sequence);
+                        }
+                    }
+                }
             }
             Entry::Vacant(entry) => {
-                let group_index = sample_groups.len();
-                entry.insert(group_index);
-                sample_groups.push((sample, vec![record]));
+                entry.insert(new_sequence);
             }
         }
     }
@@ -318,76 +309,13 @@ fn parse_gene_alignment(
         bail!("alignment '{}' contains no FASTA records", path.display());
     };
 
-    let affected_sample_count = sample_groups
-        .iter()
-        .filter(|(_, records)| records.len() > 1)
-        .count();
-    let (global_sample_indices, sequences) =
-        resolve_paralogs(sample_groups, sample_indices, paralog_mode);
-    let gene = Gene::new(
-        gene_name.clone(),
-        alignment_len,
-        global_sample_indices,
-        sequences,
-    );
+    let paralog_count = paralog_counts.values().sum();
 
-    Ok(ParsedGene {
-        gene,
-        paralog: (affected_sample_count > 0).then_some((gene_name, affected_sample_count)),
-    })
-}
+    Ok(Gene::new(gene_name.clone(),
+    alignment_len,
+    parsed_sequences,
+    paralog_count))
 
-// Resolves duplicate normalized sample IDs according to the selected mode.
-fn resolve_paralogs(
-    sample_groups: Vec<SampleGroup>,
-    sample_indices: &HashMap<&str, usize>,
-    paralog_mode: ParalogMode,
-) -> (Vec<usize>, Vec<Vec<u8>>) {
-    let mut global_sample_indices = Vec::with_capacity(sample_groups.len());
-    let mut sequences = Vec::with_capacity(sample_groups.len());
-
-    for (sample_name, records) in sample_groups {
-        let Some(sequence) = resolve_sample_group(records, paralog_mode) else {
-            continue;
-        };
-
-        let sample_index = sample_indices
-            .get(sample_name.as_str())
-            .copied()
-            .expect("alignment sample should have been validated against Rtab header");
-        global_sample_indices.push(sample_index);
-        sequences.push(sequence);
-    }
-
-    (global_sample_indices, sequences)
-}
-
-// Selects the sequence to keep for a single normalized sample group.
-fn resolve_sample_group(mut records: SampleRecords, paralog_mode: ParalogMode) -> Option<Vec<u8>> {
-    debug_assert!(!records.is_empty());
-
-    match paralog_mode {
-        ParalogMode::First => Some(records.remove(0).0),
-        ParalogMode::Skip if records.len() > 1 => None,
-        ParalogMode::Skip => Some(records.remove(0).0),
-        ParalogMode::Longest => {
-            let mut best_index = 0;
-            let mut best_non_gap_count = records[0].1;
-            for (index, record) in records.iter().enumerate().skip(1) {
-                if record.1 > best_non_gap_count {
-                    best_index = index;
-                    best_non_gap_count = record.1;
-                }
-            }
-
-            Some(records.swap_remove(best_index).0)
-        }
-    }
-}
-
-// Counts non-gap characters for longest-paralog resolution.
-fn non_gap_count(sequence: &[u8]) -> usize {
-    sequence.iter().filter(|&&base| base != b'-').count()
 }
 
 // Drops alignments with entropy strictly greater than the requested threshold.
@@ -595,11 +523,10 @@ fn parse_csv_record(line: &str) -> Result<Vec<String>> {
 }
 
 // Normalizes a FASTA record identifier to its sample name.
-fn normalize_sample_id(record_id: &str) -> String {
+fn normalize_sample_id(record_id: &str) -> &str {
     record_id
         .split_once(';')
         .map_or(record_id, |(sample, _)| sample)
-        .to_owned()
 }
 
 // Opens plain or gzip-compressed alignment input for reading.
@@ -884,6 +811,19 @@ mod tests {
     }
 
     #[test]
+    // Verifies unknown samples are rejected after Panaroo-style ID normalization.
+    fn parser_rejects_unknown_normalized_sample_names() {
+        let dir = TempDir::new().unwrap();
+        let path = write_alignment(&dir, "gene.aln", ">sample1\nACGT\n>sample3;copy\nACGT\n");
+
+        let error = parse_default(&path).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("sample 'sample3'"), "error: {message}");
+        assert!(message.contains("does not appear"), "error: {message}");
+    }
+
+    #[test]
     // Verifies zero-length FASTA records are rejected.
     fn parser_rejects_zero_length_sequences() {
         let dir = TempDir::new().unwrap();
@@ -1145,11 +1085,11 @@ mod tests {
             ),
         ];
         let rows = vec![
-            RecombinationRow {
+            OutputRow {
                 gene_index: 0,
                 presence: vec![1, 0],
             },
-            RecombinationRow {
+            OutputRow {
                 gene_index: 1,
                 presence: vec![0, 1],
             },

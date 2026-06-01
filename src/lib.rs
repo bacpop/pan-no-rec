@@ -36,7 +36,6 @@ pub fn get_progress_bar(length: usize, percent: bool, quiet: bool) -> ProgressBa
 }
 
 #[doc(hidden)]
-#[cfg(not(target_arch = "wasm32"))]
 pub fn main() -> Result<()> {
     let args = cli_args();
     if args.quiet {
@@ -62,44 +61,45 @@ pub fn main() -> Result<()> {
     let start = Instant::now();
 
     log::info!("Reading Panaroo input files");
-    let loaded = load_genes(
+    let genes = load_genes(
         &args.panaroo_dir,
         args.paralog_mode,
         args.max_entropy,
         args.quiet,
     )?;
-    if !loaded.paralogs.is_empty() {
-        write_paralog_report(&args.paralog_report, &loaded.paralogs)?;
-        log::warn!(
-            "{} alignments contained paralogs; wrote paralog report to '{}'; using paralog mode '{}'",
-            loaded.paralogs.len(),
-            args.paralog_report.display(),
-            args.paralog_mode
-        );
-    }
 
-    let sample_names = loaded.sample_names;
-    let genes = loaded.genes;
-    if genes.is_empty() {
+    let sample_names = genes.sample_names;
+    let sequences = genes.gene_sequences;
+    if sequences.is_empty() {
         bail!("No valid genes loaded");
     } else if sample_names.is_empty() {
         bail!("Alignments are empty");
     } else {
         log::info!(
             "Read {} alignments and {} samples",
-            genes.len(),
+            sequences.len(),
             sample_names.len()
         );
     }
 
+    let n_paralogs = write_paralog_report(&args.paralog_report, &sequences)?;
+    if n_paralogs > 1 {
+        log::warn!(
+            "{} alignments contained paralogs; wrote paralog report to '{}'; using paralog mode '{}'",
+            n_paralogs,
+            args.paralog_report.display(),
+            args.paralog_mode
+        );
+    }
+
     log::info!("Running recombination detection: fitting pairwise distance models");
-    let gene_hits = compare_loaded_alignments(sample_names.len(), &genes, args.gaps, args.quiet);
+    let gene_hits = compare_loaded_alignments(sample_names.len(), &sequences, args.gaps, args.quiet);
 
     log::info!("Running recombination detection: using graphs to find genes");
-    let rows = presence_table_from_pair_hits(sample_names.len(), &genes, &gene_hits, args.quiet);
+    let rows = presence_table_from_pair_hits(sample_names.len(), &sequences, &gene_hits, args.quiet);
 
     log::info!("Writing output");
-    write_recombination_table(&sample_names, &genes, &rows, stdout().lock())
+    write_recombination_table(&sample_names, &sequences, &rows, stdout().lock())
         .with_context(|| "failed to write recombination table to stdout")?;
     let end = Instant::now();
 

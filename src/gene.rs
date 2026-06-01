@@ -2,7 +2,7 @@ use hashbrown::HashMap;
 use roaring::RoaringBitmap;
 
 #[derive(Clone, Debug, Default)]
-struct SampleBases {
+pub(crate) struct SampleBases {
     a: RoaringBitmap,
     c: RoaringBitmap,
     g: RoaringBitmap,
@@ -12,7 +12,7 @@ struct SampleBases {
 
 impl SampleBases {
     // Encodes a sequence into per-base bitmap positions.
-    fn from_sequence(sequence: &[u8]) -> Self {
+    pub(crate) fn from_sequence(sequence: &[u8]) -> Self {
         let mut bases = SampleBases::default();
 
         for (position, &base) in sequence.iter().enumerate() {
@@ -93,41 +93,34 @@ impl SampleBases {
             }
         }
     }
+
+    // Counts positions encoded as any non-gap base.
+    pub(crate) fn non_gap_count(&self, alignment_len: usize) -> usize {
+        alignment_len - self.gap.len() as usize
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct Gene {
     name: String,
     alignment_len: usize,
-    sample_indices: HashMap<usize, usize>,
-    samples: Vec<SampleBases>,
+    sequences: HashMap<usize, SampleBases>,
+    paralog_count: usize,
 }
 
 impl Gene {
-    // Builds a gene from ordered global sample indices and aligned sequences.
+    // Builds a gene from ordered global sample indices and pre-encoded samples.
     pub(crate) fn new(
         name: String,
         alignment_len: usize,
-        global_sample_indices: Vec<usize>,
-        ordered_sequences: Vec<Vec<u8>>,
+        sequences: HashMap<usize, SampleBases>,
+        paralog_count: usize,
     ) -> Self {
-        debug_assert_eq!(global_sample_indices.len(), ordered_sequences.len());
-
-        let sample_indices = global_sample_indices
-            .into_iter()
-            .enumerate()
-            .map(|(local_index, global_index)| (global_index, local_index))
-            .collect();
-        let samples = ordered_sequences
-            .iter()
-            .map(|sequence| SampleBases::from_sequence(sequence))
-            .collect();
-
         Gene {
             name,
             alignment_len,
-            sample_indices,
-            samples,
+            sequences,
+            paralog_count,
         }
     }
 
@@ -137,8 +130,8 @@ impl Gene {
     // If gaps = false, gap positions are ignored completely
     // Returns the number of mismatches, and the aligned length
     pub(crate) fn snp_count(&self, sample_a: usize, sample_b: usize, gaps: bool) -> (usize, usize) {
-        let left = &self.samples[sample_a];
-        let right = &self.samples[sample_b];
+        let left = &self.sequences[&sample_a];
+        let right = &self.sequences[&sample_b];
 
         let mut matches = &left.a & &right.a;
         matches |= &left.c & &right.c;
@@ -160,9 +153,8 @@ impl Gene {
         &self.name
     }
 
-    // Looks up the internal sequence index for a global sample index.
-    pub(crate) fn sample_index(&self, global_sample_index: usize) -> Option<usize> {
-        self.sample_indices.get(&global_sample_index).copied()
+    pub(crate) fn paralog_count(&self) -> Option<usize> {
+        if self.paralog_count == 0 { None } else { Some(self.paralog_count) }
     }
 }
 
