@@ -6,7 +6,7 @@ use rayon::prelude::*;
 
 use crate::dists::PairHits;
 use crate::gene::Gene;
-use crate::io::OutputRow;
+use crate::output::OutputRow;
 
 type RecombinationGraph = UnGraph<usize, ()>;
 

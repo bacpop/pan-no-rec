@@ -8,8 +8,11 @@ use std::time::Instant;
 mod cli;
 use crate::cli::cli_args;
 
-mod io;
-use io::{load_genes, write_paralog_report, write_recombination_table};
+mod panaroo_io;
+use panaroo_io::load_genes;
+
+mod output;
+use output::{write_paralog_report, write_recombination_table};
 
 mod dists;
 use dists::compare_loaded_alignments;
@@ -93,10 +96,12 @@ pub fn main() -> Result<()> {
     }
 
     log::info!("Running recombination detection: fitting pairwise distance models");
-    let gene_hits = compare_loaded_alignments(sample_names.len(), &sequences, args.gaps, args.quiet);
+    let gene_hits =
+        compare_loaded_alignments(sample_names.len(), &sequences, args.gaps, args.quiet);
 
     log::info!("Running recombination detection: using graphs to find genes");
-    let rows = presence_table_from_pair_hits(sample_names.len(), &sequences, &gene_hits, args.quiet);
+    let rows =
+        presence_table_from_pair_hits(sample_names.len(), &sequences, &gene_hits, args.quiet);
 
     log::info!("Writing output");
     write_recombination_table(&sample_names, &sequences, &rows, stdout().lock())

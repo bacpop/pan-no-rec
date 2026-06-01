@@ -8,7 +8,7 @@ use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use seq_io::fasta::{Reader, Record};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -17,14 +17,8 @@ pub(crate) struct LoadedAlignments {
     pub(crate) gene_sequences: Vec<Gene>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OutputRow {
-    pub(crate) gene_index: usize,
-    pub(crate) presence: Vec<u8>,
-}
-
 // Finds Panaroo gene alignment files in the standard alignment directory.
-pub fn read_panaroo_dir(path: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn read_panaroo_dir(path: &Path) -> Result<Vec<PathBuf>> {
     let alignment_dir = path.join("aligned_gene_sequences");
     let paths = collect_panaroo_alignments(&alignment_dir)?;
 
@@ -72,63 +66,6 @@ fn collect_panaroo_alignments(dir: &Path) -> Result<Vec<PathBuf>> {
 
     paths.sort_unstable();
     Ok(paths)
-}
-
-// Writes a recombination presence table as tab-separated text.
-pub fn write_recombination_table<W: Write>(
-    sample_names: &[String],
-    genes: &[Gene],
-    rows: &[OutputRow],
-    mut writer: W,
-) -> Result<()> {
-    write!(writer, "gene")?;
-    for sample in sample_names {
-        write!(writer, "\t{sample}")?;
-    }
-    writeln!(writer)?;
-
-    for row in rows {
-        let gene = genes.get(row.gene_index).with_context(|| {
-            format!(
-                "recombination table row references missing gene index {}",
-                row.gene_index
-            )
-        })?;
-        write!(writer, "{}", gene.name())?;
-        for value in &row.presence {
-            write!(writer, "\t{value}")?;
-        }
-        writeln!(writer)?;
-    }
-
-    Ok(())
-}
-
-// Writes per-gene paralog metadata as tab-separated text.
-pub(crate) fn write_paralog_report(path: &Path, genes: &[Gene]) -> Result<usize> {
-    let paralog_rows: Vec<_> = genes
-        .iter()
-        .filter_map(|gene| {
-            gene.paralog_count()
-                .map(|paralog_count| (gene.name(), paralog_count))
-        })
-        .collect();
-
-    if paralog_rows.is_empty() {
-        return Ok(0);
-    }
-
-    let mut writer = File::create(path)
-        .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
-
-    writeln!(writer, "gene\tparalog_samples")
-        .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
-    for (gene_name, paralog_count) in &paralog_rows {
-        writeln!(writer, "{gene_name}\t{paralog_count}")
-            .with_context(|| format!("failed to write paralog report '{}'", path.display()))?;
-    }
-
-    Ok(paralog_rows.len())
 }
 
 // Loads all Panaroo alignments into genes using the Rtab header sample order.
@@ -1115,49 +1052,5 @@ mod tests {
         let error = read_alignment_entropy(&path).unwrap_err();
 
         assert!(error.to_string().contains("invalid entropy"));
-    }
-
-    #[test]
-    // Verifies recombination tables are emitted as expected TSV.
-    fn write_recombination_table_emits_tsv() {
-        let sample_names = vec!["alpha".to_string(), "beta".to_string()];
-        let genes = vec![
-            Gene::new(
-                "gene1".to_string(),
-                1,
-                HashMap::from([
-                    (0, SampleBases::from_sequence(b"A")),
-                    (1, SampleBases::from_sequence(b"A")),
-                ]),
-                0,
-            ),
-            Gene::new(
-                "gene2".to_string(),
-                1,
-                HashMap::from([
-                    (0, SampleBases::from_sequence(b"A")),
-                    (1, SampleBases::from_sequence(b"A")),
-                ]),
-                0,
-            ),
-        ];
-        let rows = vec![
-            OutputRow {
-                gene_index: 0,
-                presence: vec![1, 0],
-            },
-            OutputRow {
-                gene_index: 1,
-                presence: vec![0, 1],
-            },
-        ];
-        let mut output = Vec::new();
-
-        write_recombination_table(&sample_names, &genes, &rows, &mut output).unwrap();
-
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "gene\talpha\tbeta\ngene1\t1\t0\ngene2\t0\t1\n"
-        );
     }
 }

@@ -147,8 +147,9 @@ fn collect_comparable_pair_gene_stats(
 mod tests {
     use super::*;
     use crate::cli::ParalogMode;
-    use crate::io::OutputRow;
-    use crate::{load_genes, presence_table_from_pair_hits};
+    use crate::output::OutputRow;
+    use crate::panaroo_io::load_genes;
+    use crate::presence_table_from_pair_hits;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -276,7 +277,8 @@ mod tests {
         write_alignment(&dir, "gene_ab.aln.fas", ">alpha\nAAAA\n>beta\nCCCC\n");
         write_alignment(&dir, "gene_ag.aln.fas", ">alpha\nAAAA\n>gamma\nTTTT\n");
         write_alignment(&dir, "gene_bg.aln.fas", ">beta\nCCCC\n>gamma\nTTTT\n");
-        let loaded = crate::io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
+        let loaded =
+            crate::panaroo_io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
         let gene_sort_ranks = gene_sort_ranks(&loaded.gene_sequences);
 
         let observed: Vec<_> = collect_comparable_pair_gene_stats(
@@ -300,7 +302,8 @@ mod tests {
         write_rtab(&dir, &["alpha", "beta"]);
         write_alignment(&dir, "gene_zero.aln.fas", ">alpha\n----\n>beta\nAAAA\n");
         write_alignment(&dir, "gene_positive.aln.fas", ">alpha\nAAAA\n>beta\nAAAT\n");
-        let loaded = crate::io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
+        let loaded =
+            crate::panaroo_io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
         let gene_sort_ranks = gene_sort_ranks(&loaded.gene_sequences);
 
         let observed: Vec<_> = collect_comparable_pair_gene_stats(

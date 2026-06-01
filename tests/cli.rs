@@ -233,7 +233,7 @@ fn cli_summarizes_paralog_warnings_and_writes_default_report() {
     );
     assert_eq!(
         fs::read_to_string(dir.path().join("paralogs.txt")).unwrap(),
-        "gene\tparalog_samples\ngene_dup_a\t1\ngene_dup_b\t2\n"
+        "gene\tparalogs\ngene_dup_a\t1\ngene_dup_b\t2\n"
     );
 }
 
@@ -266,7 +266,7 @@ fn cli_writes_custom_paralog_report_path() {
     );
     assert_eq!(
         fs::read_to_string(report_path).unwrap(),
-        "gene\tparalog_samples\ngene_dup\t1\n"
+        "gene\tparalogs\ngene_dup\t1\n"
     );
 }
 
@@ -332,7 +332,7 @@ fn cli_quiet_suppresses_paralog_warning_but_writes_report() {
     );
     assert_eq!(
         fs::read_to_string(report_path).unwrap(),
-        "gene\tparalog_samples\ngene_dup\t1\n"
+        "gene\tparalogs\ngene_dup\t1\n"
     );
 }
 
