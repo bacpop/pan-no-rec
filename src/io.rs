@@ -726,8 +726,8 @@ mod tests {
     }
 
     #[test]
-    // Verifies skip mode marks duplicated samples for load-time filtering.
-    fn parser_skip_mode_marks_duplicated_samples() {
+    // Verifies skip mode removes only duplicated samples from a gene.
+    fn parser_skip_mode_removes_only_duplicated_samples() {
         let dir = TempDir::new().unwrap();
         let path = write_alignment(
             &dir,
@@ -739,9 +739,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(gene.paralog_count(), Some(1));
-        assert!(gene.has_sample(0));
+        assert!(!gene.has_sample(0));
         assert!(gene.has_sample(1));
         assert!(gene.has_sample(2));
+        assert_eq!(gene.snp_count(1, 2, false), (4, 4));
     }
 
     #[test]
@@ -952,8 +953,8 @@ mod tests {
     }
 
     #[test]
-    // Verifies skip mode filters out genes with any paralog at load time.
-    fn load_genes_skip_mode_filters_paralogous_genes() {
+    // Verifies skip mode retains paralogous genes while removing duplicated samples.
+    fn load_genes_skip_mode_removes_only_duplicated_samples() {
         let dir = TempDir::new().unwrap();
         write_rtab(&dir, &["s1", "s2"]);
         write_panaroo_alignment(
@@ -965,9 +966,16 @@ mod tests {
 
         let loaded = load_genes(dir.path(), ParalogMode::Skip, None, true).unwrap();
 
-        assert_eq!(loaded.gene_sequences.len(), 1);
+        assert_eq!(loaded.gene_sequences.len(), 2);
         assert_eq!(loaded.gene_sequences[0].name(), "gene_clean");
         assert_eq!(loaded.gene_sequences[0].paralog_count(), None);
+        assert!(loaded.gene_sequences[0].has_sample(0));
+        assert!(loaded.gene_sequences[0].has_sample(1));
+
+        assert_eq!(loaded.gene_sequences[1].name(), "gene_dup");
+        assert_eq!(loaded.gene_sequences[1].paralog_count(), Some(1));
+        assert!(!loaded.gene_sequences[1].has_sample(0));
+        assert!(loaded.gene_sequences[1].has_sample(1));
     }
 
     #[test]
