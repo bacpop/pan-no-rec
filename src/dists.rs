@@ -9,7 +9,12 @@ pub type PairHits = HashMap<String, Vec<(String, String)>>;
 type SamplePair = (String, String);
 
 // Runs pairwise comparison across all sample pairs for loaded genes.
-pub fn compare_loaded_alignments(sample_names: &[String], genes: &[Gene], quiet: bool) -> PairHits {
+pub fn compare_loaded_alignments(
+    sample_names: &[String],
+    genes: &[Gene],
+    gaps: bool,
+    quiet: bool,
+) -> PairHits {
     // Flatten the upper triangle of the sample-by-sample matrix into one Rayon
     // range. That gives Rayon similarly sized units of work for each sample pair,
     // instead of parallelizing only by the outer sample index where early rows are
@@ -21,7 +26,12 @@ pub fn compare_loaded_alignments(sample_names: &[String], genes: &[Gene], quiet:
         .progress_with(progress_bar)
         .flat_map_iter(|pair_offset| {
             let (sample_a, sample_b) = sample_pair_indices(sample_names.len(), pair_offset);
-            selected_pair_hits(genes, &sample_names[sample_a], &sample_names[sample_b])
+            selected_pair_hits(
+                genes,
+                &sample_names[sample_a],
+                &sample_names[sample_b],
+                gaps,
+            )
         })
         .collect();
 
@@ -71,9 +81,14 @@ fn pairs_before_sample(sample_count: usize, sample_index: usize) -> usize {
 }
 
 // Selects recombinant genes for one sample pair and tags them with that pair.
-fn selected_pair_hits(genes: &[Gene], sample_a: &str, sample_b: &str) -> Vec<(String, SamplePair)> {
-    let pair_genes = collect_comparable_pair_gene_stats(genes, sample_a, sample_b);
-    let recombinant_gene_indices = select_recombinant_gene_indices(pair_genes);
+fn selected_pair_hits(
+    genes: &[Gene],
+    sample_a: &str,
+    sample_b: &str,
+    gaps: bool,
+) -> Vec<(String, SamplePair)> {
+    let pair_genes = collect_comparable_pair_gene_stats(genes, sample_a, sample_b, gaps);
+    let recombinant_gene_indices = select_recombinant_gene_indices(pair_genes.clone());
     let pair = (sample_a.to_owned(), sample_b.to_owned());
 
     recombinant_gene_indices
@@ -87,6 +102,7 @@ fn collect_comparable_pair_gene_stats<'a>(
     genes: &'a [Gene],
     sample_a: &str,
     sample_b: &str,
+    gaps: bool,
 ) -> Vec<PairGeneStats<'a>> {
     genes
         .iter()
@@ -95,11 +111,12 @@ fn collect_comparable_pair_gene_stats<'a>(
             let sample_a_index = gene.sample_index(sample_a)?;
             let sample_b_index = gene.sample_index(sample_b)?;
 
+            let (snps, length) = gene.snp_count(sample_a_index, sample_b_index, gaps);
             Some(PairGeneStats {
                 gene_index,
                 gene_id: gene.name(),
-                snps: gene.snp_count(sample_a_index, sample_b_index),
-                length: gene.alignment_len(),
+                snps,
+                length,
             })
         })
         .collect()
@@ -121,7 +138,7 @@ mod tests {
     {
         let loaded =
             load_genes(aln_paths, ParalogMode::First, true).expect("Test gene load failed");
-        let hits = compare_loaded_alignments(&loaded.sample_names, &loaded.genes, true);
+        let hits = compare_loaded_alignments(&loaded.sample_names, &loaded.genes, false, true);
         (loaded.sample_names, loaded.genes, hits)
     }
 
@@ -240,10 +257,11 @@ mod tests {
         let loaded =
             crate::io::load_genes(&[gene_ab, gene_ag, gene_bg], ParalogMode::First, true).unwrap();
 
-        let observed: Vec<_> = collect_comparable_pair_gene_stats(&loaded.genes, "alpha", "beta")
-            .into_iter()
-            .map(|stats| stats.gene_id)
-            .collect();
+        let observed: Vec<_> =
+            collect_comparable_pair_gene_stats(&loaded.genes, "alpha", "beta", false)
+                .into_iter()
+                .map(|stats| stats.gene_id)
+                .collect();
 
         assert_eq!(observed, vec!["gene_ab"]);
     }

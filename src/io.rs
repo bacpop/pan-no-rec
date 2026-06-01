@@ -630,8 +630,8 @@ mod tests {
         assert_eq!(loaded.genes[0].sample_index("s2"), Some(1));
         assert_eq!(loaded.genes[1].sample_index("s2"), Some(0));
         assert_eq!(loaded.genes[1].sample_index("s1"), Some(1));
-        assert_eq!(loaded.genes[0].snp_count(0, 1), 4);
-        assert_eq!(loaded.genes[1].snp_count(0, 1), 4);
+        assert_eq!(loaded.genes[0].snp_count(0, 1, false), (4, 4));
+        assert_eq!(loaded.genes[1].snp_count(0, 1, false), (4, 4));
     }
 
     #[test]

@@ -132,7 +132,11 @@ impl Gene {
     }
 
     // Counts non-matching alignment columns between two samples.
-    pub(crate) fn snp_count(&self, sample_a: usize, sample_b: usize) -> usize {
+    // Ignores sites which are both gaps
+    // If gaps == true, counts a gap vs base as a mismatch and includes in the length
+    // If gaps = false, gap positions are ignored completely
+    // Returns the number of mismatches, and the aligned length
+    pub(crate) fn snp_count(&self, sample_a: usize, sample_b: usize, gaps: bool) -> (usize, usize) {
         let left = &self.samples[sample_a];
         let right = &self.samples[sample_b];
 
@@ -140,19 +144,20 @@ impl Gene {
         matches |= &left.c & &right.c;
         matches |= &left.g & &right.g;
         matches |= &left.t & &right.t;
-        matches |= &left.gap & &right.gap;
 
-        self.alignment_len - matches.len() as usize
+        let both_gap = &left.gap & &right.gap;
+        let length = if gaps {
+            self.alignment_len - both_gap.len() as usize
+        } else {
+            self.alignment_len - (left.gap.len() + right.gap.len() - both_gap.len()) as usize
+        };
+
+        (length - matches.len() as usize, length)
     }
 
     // Returns the gene identifier.
     pub(crate) fn name(&self) -> &str {
         &self.name
-    }
-
-    // Returns the alignment length in columns.
-    pub(crate) fn alignment_len(&self) -> usize {
-        self.alignment_len
     }
 
     // Looks up the internal index for a sample name.
@@ -175,9 +180,9 @@ mod tests {
         )
     }
 
-    // Counts SNPs for a single-base two-sample gene.
-    fn one_base_snp_count(left: u8, right: u8) -> usize {
-        gene(&[left], &[right]).snp_count(0, 1)
+    // Counts SNPs for a single-base two-sample gene using default gap handling.
+    fn one_base_snp_count(left: u8, right: u8) -> (usize, usize) {
+        gene(&[left], &[right]).snp_count(0, 1, false)
     }
 
     // Asserts bitmap membership for one encoded base.
@@ -201,8 +206,8 @@ mod tests {
     #[test]
     // Verifies exact DNA bases only match identical bases.
     fn exact_bases_match_only_themselves() {
-        assert_eq!(gene(b"ACGT", b"ACGT").snp_count(0, 1), 0);
-        assert_eq!(gene(b"ACGT", b"TGCA").snp_count(0, 1), 4);
+        assert_eq!(gene(b"ACGT", b"ACGT").snp_count(0, 1, false), (0, 4));
+        assert_eq!(gene(b"ACGT", b"TGCA").snp_count(0, 1, false), (4, 4));
     }
 
     #[test]
@@ -241,47 +246,34 @@ mod tests {
     #[test]
     // Verifies ambiguous bases match when their base sets overlap.
     fn iupac_bases_match_when_any_membership_overlaps() {
-        assert_eq!(one_base_snp_count(b'R', b'A'), 0);
-        assert_eq!(one_base_snp_count(b'R', b'G'), 0);
-        assert_eq!(one_base_snp_count(b'R', b'C'), 1);
-        assert_eq!(one_base_snp_count(b'B', b'A'), 1);
-        assert_eq!(one_base_snp_count(b'B', b'T'), 0);
-        assert_eq!(gene(b"MRWSYKVHDB", b"AATCTGCATG").snp_count(0, 1), 0);
+        assert_eq!(one_base_snp_count(b'R', b'A'), (0, 1));
+        assert_eq!(one_base_snp_count(b'R', b'G'), (0, 1));
+        assert_eq!(one_base_snp_count(b'R', b'C'), (1, 1));
+        assert_eq!(one_base_snp_count(b'B', b'A'), (1, 1));
+        assert_eq!(one_base_snp_count(b'B', b'T'), (0, 1));
+        assert_eq!(
+            gene(b"MRWSYKVHDB", b"AATCTGCATG").snp_count(0, 1, false),
+            (0, 10)
+        );
     }
 
     #[test]
     // Verifies N and unknown non-gap bases match ordinary bases.
     fn n_and_unknown_non_gap_characters_match_any_ordinary_base() {
-        assert_eq!(gene(b"NX?z", b"ACGT").snp_count(0, 1), 0);
-        assert_eq!(one_base_snp_count(b'n', b't'), 0);
-        assert_eq!(one_base_snp_count(b'?', b'A'), 0);
-        assert_eq!(one_base_snp_count(b'X', b'C'), 0);
+        assert_eq!(gene(b"NX?z", b"ACGT").snp_count(0, 1, false), (0, 4));
+        assert_eq!(one_base_snp_count(b'n', b't'), (0, 1));
+        assert_eq!(one_base_snp_count(b'?', b'A'), (0, 1));
+        assert_eq!(one_base_snp_count(b'X', b'C'), (0, 1));
     }
 
     #[test]
-    // Verifies gaps only match other gaps.
-    fn gap_matches_only_gap() {
+    // Verifies gaps are ignored by default, and counted only in gap-inclusive mode.
+    fn gap_handling_depends_on_gap_mode() {
         assert_membership(b'-', false, false, false, false, true);
-        assert_eq!(one_base_snp_count(b'-', b'-'), 0);
-        assert_eq!(one_base_snp_count(b'-', b'A'), 1);
-        assert_eq!(one_base_snp_count(b'-', b'R'), 1);
-        assert_eq!(one_base_snp_count(b'-', b'N'), 1);
-        assert_eq!(one_base_snp_count(b'-', b'?'), 1);
-    }
 
-    #[test]
-    // Verifies simple two-sample SNP counting.
-    fn two_sample_one_gene_has_expected_snp_count() {
-        let gene = gene(b"AAAA", b"AACC");
+        let gene = gene(b"A--CGGTTT-", b"ACCCTG----");
 
-        assert_eq!(gene.snp_count(0, 1), 2);
-    }
-
-    #[test]
-    // Verifies gap mismatches contribute to the SNP count.
-    fn gap_mismatch_positions_are_counted() {
-        let gene = gene(b"A-N?", b"AA-G");
-
-        assert_eq!(gene.snp_count(0, 1), 2);
+        assert_eq!(gene.snp_count(0, 1, false), (1, 4));
+        assert_eq!(gene.snp_count(0, 1, true), (6, 9));
     }
 }

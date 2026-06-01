@@ -95,7 +95,7 @@ pub fn main() -> Result<()> {
     }
 
     log::info!("Running recombination detection: fitting pairwise distance models");
-    let gene_hits = compare_loaded_alignments(&sample_names, &genes, args.quiet);
+    let gene_hits = compare_loaded_alignments(&sample_names, &genes, args.gaps, args.quiet);
 
     log::info!("Running recombination detection: using graphs to find genes");
     let table = presence_table_from_pair_hits(&sample_names, &genes, &gene_hits, args.quiet);

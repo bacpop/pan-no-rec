@@ -51,6 +51,10 @@ pub(crate) struct Args {
     #[arg(long, value_name = "PATH", default_value = "paralogs.txt")]
     pub paralog_report: PathBuf,
 
+    /// Include gaps as SNPs
+    #[arg(long, default_value_t = false)]
+    pub gaps: bool,
+
     /// Show progress messages
     #[arg(short, long, global = true)]
     pub verbose: bool,
