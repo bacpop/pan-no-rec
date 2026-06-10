@@ -22,6 +22,30 @@ impl SampleBases {
         bases
     }
 
+    pub(crate) fn append_shifted(&mut self, source: SampleBases, offset: u32) {
+        append_shifted_bitmap(&mut self.a, source.a, offset);
+        append_shifted_bitmap(&mut self.c, source.c, offset);
+        append_shifted_bitmap(&mut self.g, source.g, offset);
+        append_shifted_bitmap(&mut self.t, source.t, offset);
+        append_shifted_bitmap(&mut self.gap, source.gap, offset);
+    }
+
+    pub(crate) fn matching_sites(&self, other: &Self) -> RoaringBitmap {
+        let mut matches = &self.a & &other.a;
+        matches |= &self.c & &other.c;
+        matches |= &self.g & &other.g;
+        matches |= &self.t & &other.t;
+        matches
+    }
+
+    pub(crate) fn both_gap_sites(&self, other: &Self) -> RoaringBitmap {
+        &self.gap & &other.gap
+    }
+
+    pub(crate) fn either_gap_sites(&self, other: &Self) -> RoaringBitmap {
+        &self.gap | &other.gap
+    }
+
     // Records one alignment position under its matching base set.
     fn insert_base(&mut self, position: u32, base: u8) {
         match base.to_ascii_uppercase() {
@@ -100,6 +124,37 @@ impl SampleBases {
     }
 }
 
+fn append_shifted_bitmap(target: &mut RoaringBitmap, source: RoaringBitmap, offset: u32) {
+    target.extend(source.into_iter().map(|position| position + offset));
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GeneMetadata {
+    name: String,
+    paralog_count: usize,
+}
+
+impl GeneMetadata {
+    pub(crate) fn new(name: String, paralog_count: usize) -> Self {
+        GeneMetadata {
+            name,
+            paralog_count,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn paralog_count(&self) -> Option<usize> {
+        if self.paralog_count == 0 {
+            None
+        } else {
+            Some(self.paralog_count)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Gene {
     name: String,
@@ -129,44 +184,57 @@ impl Gene {
     // If gaps == true, counts a gap vs base as a mismatch and includes in the length
     // If gaps = false, gap positions are ignored completely
     // Returns the number of mismatches, and the aligned length
+    #[cfg(test)]
     pub(crate) fn snp_count(&self, sample_a: usize, sample_b: usize, gaps: bool) -> (usize, usize) {
         let left = &self.sequences[&sample_a];
         let right = &self.sequences[&sample_b];
 
-        let mut matches = &left.a & &right.a;
-        matches |= &left.c & &right.c;
-        matches |= &left.g & &right.g;
-        matches |= &left.t & &right.t;
-
-        let both_gap = &left.gap & &right.gap;
+        let matches = left.matching_sites(right);
+        let both_gap = left.both_gap_sites(right);
         let length = if gaps {
             self.alignment_len - both_gap.len() as usize
         } else {
-            self.alignment_len - (left.gap.len() + right.gap.len() - both_gap.len()) as usize
+            self.alignment_len - left.gap.union_len(&right.gap) as usize
         };
 
         (length - matches.len() as usize, length)
     }
 
+    #[cfg(test)]
     pub(crate) fn has_sample(&self, global_sample_index: usize) -> bool {
         self.sequences.contains_key(&global_sample_index)
     }
 
+    #[cfg(test)]
     pub(crate) fn has_samples(&self, sample_a: usize, sample_b: usize) -> bool {
         self.has_sample(sample_a) && self.has_sample(sample_b)
     }
 
     // Returns the gene identifier.
+    #[cfg(test)]
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
+    #[cfg(test)]
     pub(crate) fn paralog_count(&self) -> Option<usize> {
         if self.paralog_count == 0 {
             None
         } else {
             Some(self.paralog_count)
         }
+    }
+
+    pub(crate) fn alignment_len(&self) -> usize {
+        self.alignment_len
+    }
+
+    pub(crate) fn into_parts(self) -> (GeneMetadata, usize, HashMap<usize, SampleBases>) {
+        (
+            GeneMetadata::new(self.name, self.paralog_count),
+            self.alignment_len,
+            self.sequences,
+        )
     }
 }
 

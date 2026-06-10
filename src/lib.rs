@@ -18,6 +18,9 @@ mod dists;
 use dists::compare_loaded_alignments;
 
 mod gene;
+mod genome;
+use genome::Genome;
+
 mod model;
 
 mod graph;
@@ -85,7 +88,10 @@ pub fn main() -> Result<()> {
         );
     }
 
-    let n_paralogs = write_paralog_report(&args.paralog_report, &sequences)?;
+    let (genome, gene_metadata) = Genome::try_from_genes(sample_names.len(), sequences)
+        .with_context(|| "failed to build concatenated genome")?;
+
+    let n_paralogs = write_paralog_report(&args.paralog_report, &gene_metadata)?;
     if n_paralogs > 1 {
         log::warn!(
             "{} alignments contained paralogs; wrote paralog report to '{}'; using paralog mode '{}'",
@@ -96,15 +102,18 @@ pub fn main() -> Result<()> {
     }
 
     log::info!("Running recombination detection: fitting pairwise distance models");
-    let gene_hits =
-        compare_loaded_alignments(sample_names.len(), &sequences, args.gaps, args.quiet);
+    let gene_hits = compare_loaded_alignments(sample_names.len(), &genome, args.gaps, args.quiet);
 
     log::info!("Running recombination detection: using graphs to find genes");
-    let rows =
-        presence_table_from_pair_hits(sample_names.len(), &sequences, &gene_hits, args.quiet);
+    let rows = presence_table_from_pair_hits(
+        sample_names.len(),
+        gene_metadata.len(),
+        &gene_hits,
+        args.quiet,
+    );
 
     log::info!("Writing output");
-    write_recombination_table(&sample_names, &sequences, &rows, stdout().lock())
+    write_recombination_table(&sample_names, &gene_metadata, &rows, stdout().lock())
         .with_context(|| "failed to write recombination table to stdout")?;
     let end = Instant::now();
 

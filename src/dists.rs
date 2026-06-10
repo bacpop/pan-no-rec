@@ -1,4 +1,4 @@
-use crate::gene::Gene;
+use crate::genome::Genome;
 use crate::get_progress_bar;
 use crate::model::{PairGeneStats, select_recombinant_gene_indices};
 use hashbrown::HashMap;
@@ -11,15 +11,16 @@ type SamplePair = (usize, usize);
 // Runs pairwise comparison across all sample pairs for loaded genes.
 pub fn compare_loaded_alignments(
     sample_count: usize,
-    genes: &[Gene],
+    genome: &Genome,
     gaps: bool,
     quiet: bool,
 ) -> PairHits {
+    debug_assert_eq!(sample_count, genome.sample_count());
+
     // Flatten the upper triangle of the sample-by-sample matrix into one Rayon
     // range. That gives Rayon similarly sized units of work for each sample pair,
     // instead of parallelizing only by the outer sample index where early rows are
     // much larger than later rows.
-    let gene_sort_ranks = gene_sort_ranks(genes);
     let sample_pair_count = sample_pair_count(sample_count);
     let progress_bar = get_progress_bar(sample_pair_count, true, quiet);
     let gene_pair_hits: Vec<_> = (0..sample_pair_count)
@@ -27,7 +28,7 @@ pub fn compare_loaded_alignments(
         .progress_with(progress_bar)
         .flat_map_iter(|pair_offset| {
             let (sample_a, sample_b) = sample_pair_indices(sample_count, pair_offset);
-            selected_pair_hits(genes, &gene_sort_ranks, sample_a, sample_b, gaps)
+            selected_pair_hits(genome, sample_a, sample_b, gaps)
         })
         .collect();
 
@@ -38,23 +39,6 @@ pub fn compare_loaded_alignments(
     }
 
     hits
-}
-
-// Computes each gene's lexicographic sort rank by gene name.
-fn gene_sort_ranks(genes: &[Gene]) -> Vec<usize> {
-    let mut ordered_indices: Vec<_> = (0..genes.len()).collect();
-    ordered_indices.sort_by(|&left, &right| {
-        genes[left]
-            .name()
-            .cmp(genes[right].name())
-            .then_with(|| left.cmp(&right))
-    });
-
-    let mut ranks = vec![0; genes.len()];
-    for (rank, gene_index) in ordered_indices.into_iter().enumerate() {
-        ranks[gene_index] = rank;
-    }
-    ranks
 }
 
 // Counts unique unordered sample pairs.
@@ -95,14 +79,12 @@ fn pairs_before_sample(sample_count: usize, sample_index: usize) -> usize {
 
 // Selects recombinant genes for one sample pair and tags them with that pair.
 fn selected_pair_hits(
-    genes: &[Gene],
-    gene_sort_ranks: &[usize],
+    genome: &Genome,
     sample_a: usize,
     sample_b: usize,
     gaps: bool,
 ) -> Vec<(usize, SamplePair)> {
-    let pair_genes =
-        collect_comparable_pair_gene_stats(genes, gene_sort_ranks, sample_a, sample_b, gaps);
+    let pair_genes = collect_comparable_pair_gene_stats(genome, sample_a, sample_b, gaps);
     let recombinant_gene_indices = select_recombinant_gene_indices(pair_genes);
     let pair = (sample_a, sample_b);
 
@@ -114,39 +96,19 @@ fn selected_pair_hits(
 
 // Collects SNP and length statistics for genes containing both samples.
 fn collect_comparable_pair_gene_stats(
-    genes: &[Gene],
-    gene_sort_ranks: &[usize],
+    genome: &Genome,
     sample_a: usize,
     sample_b: usize,
     gaps: bool,
 ) -> Vec<PairGeneStats> {
-    genes
-        .iter()
-        .enumerate()
-        .filter_map(|(gene_index, gene)| {
-            if !gene.has_samples(sample_a, sample_b) {
-                return None;
-            }
-
-            let (snps, length) = gene.snp_count(sample_a, sample_b, gaps);
-            if length == 0 {
-                return None;
-            }
-
-            Some(PairGeneStats {
-                gene_index,
-                gene_sort_rank: gene_sort_ranks[gene_index],
-                snps,
-                length,
-            })
-        })
-        .collect()
+    genome.gene_snp_counts(sample_a, sample_b, gaps)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::ParalogMode;
+    use crate::gene::GeneMetadata;
     use crate::output::OutputRow;
     use crate::panaroo_io::load_genes;
     use crate::presence_table_from_pair_hits;
@@ -154,16 +116,13 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    fn compare_alignments(panaroo_dir: &Path) -> (Vec<String>, Vec<Gene>, PairHits) {
+    fn compare_alignments(panaroo_dir: &Path) -> (Vec<String>, Vec<GeneMetadata>, PairHits) {
         let loaded =
             load_genes(panaroo_dir, ParalogMode::First, None, true).expect("Test gene load failed");
-        let hits = compare_loaded_alignments(
-            loaded.sample_names.len(),
-            &loaded.gene_sequences,
-            false,
-            true,
-        );
-        (loaded.sample_names, loaded.gene_sequences, hits)
+        let sample_count = loaded.sample_names.len();
+        let (genome, genes) = Genome::try_from_genes(sample_count, loaded.gene_sequences).unwrap();
+        let hits = compare_loaded_alignments(sample_count, &genome, false, true);
+        (loaded.sample_names, genes, hits)
     }
 
     // Normalizes Rayon-collected hit order for tests that compare pair vectors.
@@ -175,7 +134,7 @@ mod tests {
 
     fn infer_recombination_presence(panaroo_dir: &Path) -> Vec<OutputRow> {
         let (sample_names, genes, hits) = compare_alignments(panaroo_dir);
-        presence_table_from_pair_hits(sample_names.len(), &genes, &hits, true)
+        presence_table_from_pair_hits(sample_names.len(), genes.len(), &hits, true)
     }
 
     // Writes the required Panaroo Rtab header fixture.
@@ -279,18 +238,13 @@ mod tests {
         write_alignment(&dir, "gene_bg.aln.fas", ">beta\nCCCC\n>gamma\nTTTT\n");
         let loaded =
             crate::panaroo_io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
-        let gene_sort_ranks = gene_sort_ranks(&loaded.gene_sequences);
+        let sample_count = loaded.sample_names.len();
+        let (genome, _) = Genome::try_from_genes(sample_count, loaded.gene_sequences).unwrap();
 
-        let observed: Vec<_> = collect_comparable_pair_gene_stats(
-            &loaded.gene_sequences,
-            &gene_sort_ranks,
-            0,
-            1,
-            false,
-        )
-        .into_iter()
-        .map(|stats| stats.gene_index)
-        .collect();
+        let observed: Vec<_> = collect_comparable_pair_gene_stats(&genome, 0, 1, false)
+            .into_iter()
+            .map(|stats| stats.gene_index)
+            .collect();
 
         assert_eq!(observed, vec![0]);
     }
@@ -304,27 +258,17 @@ mod tests {
         write_alignment(&dir, "gene_positive.aln.fas", ">alpha\nAAAA\n>beta\nAAAT\n");
         let loaded =
             crate::panaroo_io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
-        let gene_sort_ranks = gene_sort_ranks(&loaded.gene_sequences);
+        let sample_count = loaded.sample_names.len();
+        let (genome, _) = Genome::try_from_genes(sample_count, loaded.gene_sequences).unwrap();
 
-        let observed: Vec<_> = collect_comparable_pair_gene_stats(
-            &loaded.gene_sequences,
-            &gene_sort_ranks,
-            0,
-            1,
-            false,
-        )
-        .into_iter()
-        .map(|stats| (stats.gene_index, stats.snps, stats.length))
-        .collect();
+        let observed: Vec<_> = collect_comparable_pair_gene_stats(&genome, 0, 1, false)
+            .into_iter()
+            .map(|stats| (stats.gene_index, stats.snps, stats.length))
+            .collect();
 
         assert_eq!(observed, vec![(0, 1, 4)]);
 
-        let hits = compare_loaded_alignments(
-            loaded.sample_names.len(),
-            &loaded.gene_sequences,
-            false,
-            true,
-        );
+        let hits = compare_loaded_alignments(sample_count, &genome, false, true);
 
         assert!(!hits.contains_key(&1));
     }

@@ -1,4 +1,4 @@
-use crate::gene::Gene;
+use crate::gene::GeneMetadata;
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Write;
@@ -13,7 +13,7 @@ pub(crate) struct OutputRow {
 // Writes a recombination presence table as tab-separated text.
 pub fn write_recombination_table<W: Write>(
     sample_names: &[String],
-    genes: &[Gene],
+    genes: &[GeneMetadata],
     rows: &[OutputRow],
     mut writer: W,
 ) -> Result<()> {
@@ -41,7 +41,7 @@ pub fn write_recombination_table<W: Write>(
 }
 
 // Writes per-gene paralog metadata as tab-separated text.
-pub(crate) fn write_paralog_report(path: &Path, genes: &[Gene]) -> Result<usize> {
+pub(crate) fn write_paralog_report(path: &Path, genes: &[GeneMetadata]) -> Result<usize> {
     let paralog_rows: Vec<_> = genes
         .iter()
         .filter_map(|gene| {
@@ -70,32 +70,14 @@ pub(crate) fn write_paralog_report(path: &Path, genes: &[Gene]) -> Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gene::SampleBases;
-    use hashbrown::HashMap;
 
     #[test]
     // Verifies recombination tables are emitted as expected TSV.
     fn write_recombination_table_emits_tsv() {
         let sample_names = vec!["alpha".to_string(), "beta".to_string()];
         let genes = vec![
-            Gene::new(
-                "gene1".to_string(),
-                1,
-                HashMap::from([
-                    (0, SampleBases::from_sequence(b"A")),
-                    (1, SampleBases::from_sequence(b"A")),
-                ]),
-                0,
-            ),
-            Gene::new(
-                "gene2".to_string(),
-                1,
-                HashMap::from([
-                    (0, SampleBases::from_sequence(b"A")),
-                    (1, SampleBases::from_sequence(b"A")),
-                ]),
-                0,
-            ),
+            GeneMetadata::new("gene1".to_string(), 0),
+            GeneMetadata::new("gene2".to_string(), 0),
         ];
         let rows = vec![
             OutputRow {

@@ -5,7 +5,6 @@ use petgraph::graph::{NodeIndex, UnGraph};
 use rayon::prelude::*;
 
 use crate::dists::PairHits;
-use crate::gene::Gene;
 use crate::output::OutputRow;
 
 type RecombinationGraph = UnGraph<usize, ()>;
@@ -13,16 +12,15 @@ type RecombinationGraph = UnGraph<usize, ()>;
 // Builds the public presence table from pairwise recombinant hits.
 pub fn presence_table_from_pair_hits(
     sample_count: usize,
-    genes: &[Gene],
+    gene_count: usize,
     hits: &PairHits,
     quiet: bool,
 ) -> Vec<OutputRow> {
-    let progress_bar = get_progress_bar(genes.len(), false, quiet);
-    genes
-        .par_iter()
-        .enumerate()
+    let progress_bar = get_progress_bar(gene_count, false, quiet);
+    (0..gene_count)
+        .into_par_iter()
         .progress_with(progress_bar)
-        .map(|(gene_index, _)| {
+        .map(|gene_index| {
             let pairs = hits.get(&gene_index).map(Vec::as_slice).unwrap_or(&[]);
 
             OutputRow {
