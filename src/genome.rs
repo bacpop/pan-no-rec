@@ -1,8 +1,14 @@
 use crate::gene::{GeneMetadata, SampleBases, ParsedGeneAlignment};
 use crate::model::PairGeneStats;
+use crate::cli::ParalogMode;
+use crate::panaroo_io::*;
+use crate::get_progress_bar;
+
+use std::path::Path;
 use anyhow::{Result, bail};
 use roaring::RoaringBitmap;
-
+use indicatif::ParallelProgressIterator;
+use rayon::prelude::*;
 #[derive(Debug)]
 pub(crate) struct Genome {
     sample_bases: Vec<SampleBases>,
@@ -41,29 +47,27 @@ impl Genome {
                     self.sample_bases.len()
                 );
             };
+            // Concats the bitvecs by ORing them
             target.union_assign(bases);
             self.sample_gene_presence[sample_index].insert(gene_index as u32);
         }
 
         let mut mask = RoaringBitmap::new();
-        mask.insert_range(offset..end as u32);
+        mask.insert_range(offset..(offset + alignment_len as u32));
         self.gene_masks[gene_index] = mask;
-        self.gene_lengths[gene_index] = Some(alignment_len);
-        self.gene_metadata[gene_index] = Some(metadata);
-
-        Ok(())
+        self.gene_lengths[gene_index] = alignment_len;
+        self.gene_metadata[gene_index] = metadata;
     }
 
-    pub(crate) fn merge(mut self, other: Self) -> Result<Self> {
-        if self.sample_bases.len() != other.sample_bases.len()
-            || self.gene_lengths.len() != other.gene_lengths.len()
-        {
-            bail!("cannot merge incompatible genome accumulators");
-        }
+    pub(crate) fn merge(mut self, other: Self) -> Self {
+        debug_assert_eq!(self.sample_bases.len(), other.sample_bases.len());
+        debug_assert_eq!(self.gene_lengths.len(), other.gene_lengths.len());
 
+        // Combine all bitvecs
         for (left, right) in self.sample_bases.iter_mut().zip(other.sample_bases) {
             left.union_assign(right);
         }
+        // Combine pres/abs
         for (left, right) in self
             .sample_gene_presence
             .iter_mut()
@@ -72,6 +76,7 @@ impl Genome {
             *left |= &right;
         }
 
+        // Combine the Vecs
         for (gene_index, ((other_length, other_mask), other_metadata)) in other
             .gene_lengths
             .into_iter()
@@ -79,60 +84,16 @@ impl Genome {
             .zip(other.gene_metadata)
             .enumerate()
         {
-            let Some(other_length) = other_length else {
-                if other_metadata.is_some() {
-                    bail!("partial parsed alignment for gene index {gene_index}");
-                }
-                continue;
-            };
-
-            if self.gene_lengths[gene_index].is_some() {
-                bail!("duplicate parsed alignment for gene index {gene_index}");
-            }
-
-            let Some(other_metadata) = other_metadata else {
-                bail!("partial parsed alignment for gene index {gene_index}");
-            };
-            self.gene_lengths[gene_index] = Some(other_length);
+            self.gene_lengths[gene_index] = other_length;
             self.gene_masks[gene_index] = other_mask;
-            self.gene_metadata[gene_index] = Some(other_metadata);
+            self.gene_metadata[gene_index] = other_metadata;
         }
 
-        Ok(self)
+        self
     }
 
-    pub(crate) fn finish(self) -> Result<(Genome, Vec<GeneMetadata>)> {
-        let gene_metadata: Vec<_> = self
-            .gene_metadata
-            .into_iter()
-            .enumerate()
-            .map(|(gene_index, metadata)| {
-                metadata.ok_or_else(|| {
-                    anyhow::anyhow!("missing parsed metadata for gene index {gene_index}")
-                })
-            })
-            .collect::<Result<_>>()?;
-        let gene_lengths: Vec<_> = self
-            .gene_lengths
-            .into_iter()
-            .enumerate()
-            .map(|(gene_index, length)| {
-                length.ok_or_else(|| {
-                    anyhow::anyhow!("missing parsed length for gene index {gene_index}")
-                })
-            })
-            .collect::<Result<_>>()?;
-        let gene_sort_ranks = gene_sort_ranks(&gene_metadata);
-
-        let genome = Genome {
-            sample_bases: self.sample_bases,
-            gene_masks: self.gene_masks,
-            gene_lengths,
-            sample_gene_presence: self.sample_gene_presence,
-            gene_sort_ranks,
-        };
-
-        Ok((genome, gene_metadata))
+    pub(crate) fn finish(&mut self) {
+        self.gene_sort_ranks = gene_sort_ranks(&self.gene_metadata);
     }
 
     pub(crate) fn sample_count(&self) -> usize {
@@ -153,6 +114,7 @@ impl Genome {
         let comparable_genes =
             &self.sample_gene_presence[sample_a] & &self.sample_gene_presence[sample_b];
 
+        // Iterate over distances using gene-wise maps
         comparable_genes
             .into_iter()
             .filter_map(|gene_index| {
@@ -181,6 +143,20 @@ impl Genome {
             })
             .collect()
     }
+
+    pub(crate) fn get_summary(&self) -> Result<(usize, usize)> {
+        if self.gene_metadata.is_empty() {
+            bail!("No valid genes loaded");
+        } else if self.sample_bases.is_empty() {
+            bail!("Alignments are empty");
+        }
+        Ok((self.gene_metadata.len(), self.sample_bases.len()))
+    }
+
+    pub(crate) fn gene_metadata(&self) -> &Vec<GeneMetadata> {
+        &self.gene_metadata
+    }
+
 }
 
 fn gene_sort_ranks(genes: &[GeneMetadata]) -> Vec<usize> {
@@ -205,52 +181,45 @@ pub(crate) fn load_genes(
     paralog_mode: ParalogMode,
     max_entropy: Option<f64>,
     quiet: bool,
-) -> Result<LoadedAlignments> {
+) -> Result<(Vec<String>, Genome)> {
     let rtab_path = panaroo_dir.join("gene_presence_absence.Rtab");
     let sample_names = read_rtab_sample_names(&rtab_path)?;
-    let (genome, gene_metadata) = {
-        let sample_indices = build_sample_indices(&sample_names, &rtab_path)?;
-        let mut aln_paths = read_panaroo_dir(panaroo_dir)?;
-        if let Some(threshold) = max_entropy {
-            aln_paths = filter_alignments_by_entropy(panaroo_dir, aln_paths, threshold)?;
-        }
+    let sample_indices = build_sample_indices(&sample_names, &rtab_path)?;
+    let mut aln_paths = read_panaroo_dir(panaroo_dir)?;
+    if let Some(threshold) = max_entropy {
+        aln_paths = filter_alignments_by_entropy(panaroo_dir, aln_paths, threshold)?;
+    }
 
-        let alignment_lengths = read_alignment_lengths(&aln_paths)?;
-        let alignment_offsets = alignment_offsets(&alignment_lengths)?;
-        let gene_count = aln_paths.len();
-        let pbar = get_progress_bar(aln_paths.len(), false, quiet);
-        let genome_accumulator = aln_paths
-            .par_iter()
-            .enumerate()
-            .progress_with(pbar)
-            .fold(
-                || Genome::new(sample_names.len(), gene_count),
-                |mut accumulator, (gene_index, aln)| {
-                    let parsed = parse_gene_alignment(
-                        aln,
-                        gene_index,
-                        alignment_offsets[gene_index],
-                        alignment_lengths[gene_index],
-                        &sample_indices,
-                        paralog_mode,
-                    )?;
-                    accumulator.add_alignment(parsed)?;
-                    Ok::<_, anyhow::Error>(accumulator)
-                },
-            )
-            .reduce(
-                || Genome::new(sample_names.len(), gene_count),
-                |left, right| left.merge(right),
-            )?;
+    let alignment_lengths = read_alignment_lengths(&aln_paths)?;
+    let alignment_offsets = alignment_offsets(&alignment_lengths)?;
+    let gene_count = aln_paths.len();
+    let pbar = get_progress_bar(aln_paths.len(), false, quiet);
+    let mut genome_accumulator = aln_paths
+        .par_iter()
+        .enumerate()
+        .progress_with(pbar)
+        .try_fold(
+            || Genome::new(sample_names.len(), gene_count),
+            |mut accumulator, (gene_index, aln)| {
+                let parsed = parse_gene_alignment(
+                    aln,
+                    gene_index,
+                    alignment_offsets[gene_index],
+                    alignment_lengths[gene_index],
+                    &sample_indices,
+                    paralog_mode,
+                )?;
+                accumulator.add_alignment(parsed);
+                Ok::<_, anyhow::Error>(accumulator)
+            },
+        )
+        .try_reduce(
+            || Genome::new(sample_names.len(), gene_count),
+            |left, right| Ok(left.merge(right)),
+        )?;
 
-        genome_accumulator.finish()
-    };
-
-    Ok(LoadedAlignments {
-        sample_names,
-        genome,
-        gene_metadata,
-    })
+    genome_accumulator.finish();
+    Ok((sample_names, genome_accumulator))
 }
 
 #[cfg(test)]

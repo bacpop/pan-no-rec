@@ -9,7 +9,6 @@ mod cli;
 use crate::cli::cli_args;
 
 mod panaroo_io;
-use panaroo_io::load_genes;
 
 mod output;
 use output::{write_paralog_report, write_recombination_table};
@@ -19,6 +18,7 @@ use dists::compare_loaded_alignments;
 
 mod gene;
 mod genome;
+use crate::genome::load_genes;
 
 mod model;
 
@@ -66,29 +66,19 @@ pub fn main() -> Result<()> {
     let start = Instant::now();
 
     log::info!("Reading Panaroo input files");
-    let genes = load_genes(
+    let (sample_names, genes) = load_genes(
         &args.panaroo_dir,
         args.paralog_mode,
         args.max_entropy,
         args.quiet,
     )?;
 
-    let sample_names = genes.sample_names;
-    let genome = genes.genome;
-    let gene_metadata = genes.gene_metadata;
-    if gene_metadata.is_empty() {
-        bail!("No valid genes loaded");
-    } else if sample_names.is_empty() {
-        bail!("Alignments are empty");
-    } else {
-        log::info!(
-            "Read {} alignments and {} samples",
-            gene_metadata.len(),
-            sample_names.len()
-        );
-    }
+    let (n_genes, n_samples) = genes.get_summary()?;
+    log::info!(
+        "Read {n_genes} alignments and {n_samples} samples"
+    );
 
-    let n_paralogs = write_paralog_report(&args.paralog_report, &gene_metadata)?;
+    let n_paralogs = write_paralog_report(&args.paralog_report, genes.gene_metadata())?;
     if n_paralogs > 1 {
         log::warn!(
             "{} alignments contained paralogs; wrote paralog report to '{}'; using paralog mode '{}'",
@@ -99,18 +89,18 @@ pub fn main() -> Result<()> {
     }
 
     log::info!("Running recombination detection: fitting pairwise distance models");
-    let gene_hits = compare_loaded_alignments(sample_names.len(), &genome, args.gaps, args.quiet);
+    let gene_hits = compare_loaded_alignments(n_samples, &genes, args.gaps, args.quiet);
 
     log::info!("Running recombination detection: using graphs to find genes");
     let rows = presence_table_from_pair_hits(
-        sample_names.len(),
-        gene_metadata.len(),
+        n_samples,
+        n_genes,
         &gene_hits,
         args.quiet,
     );
 
     log::info!("Writing output");
-    write_recombination_table(&sample_names, &gene_metadata, &rows, stdout().lock())
+    write_recombination_table(&sample_names, genes.gene_metadata(), &rows, stdout().lock())
         .with_context(|| "failed to write recombination table to stdout")?;
     let end = Instant::now();
 

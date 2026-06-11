@@ -1,23 +1,12 @@
 use crate::cli::ParalogMode;
-use crate::gene::{GeneMetadata, SampleBases};
-use crate::genome::Genome;
-use crate::get_progress_bar;
+use crate::gene::{GeneMetadata, SampleBases, ParsedGeneAlignment};
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use hashbrown::{HashMap, hash_map::Entry};
-use indicatif::ParallelProgressIterator;
-use rayon::prelude::*;
 use seq_io::fasta::{Reader, Record};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-
-#[derive(Debug)]
-pub(crate) struct LoadedAlignments {
-    pub(crate) sample_names: Vec<String>,
-    pub(crate) genome: Genome,
-    pub(crate) gene_metadata: Vec<GeneMetadata>,
-}
 
 // Finds Panaroo gene alignment files in the standard alignment directory.
 pub(crate) fn read_panaroo_dir(path: &Path) -> Result<Vec<PathBuf>> {
@@ -71,7 +60,7 @@ fn collect_panaroo_alignments(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 // Reads only the header row of Panaroo's Rtab and returns its sample columns.
-fn read_rtab_sample_names(path: &Path) -> Result<Vec<String>> {
+pub fn read_rtab_sample_names(path: &Path) -> Result<Vec<String>> {
     let file = File::open(path)
         .with_context(|| format!("failed to read Panaroo Rtab '{}'", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -116,10 +105,10 @@ fn parse_rtab_header(path: &Path, header: &str) -> Result<Vec<String>> {
 }
 
 // Builds the global sample index and rejects duplicate or empty Rtab samples.
-fn build_sample_indices<'a>(
-    sample_names: &'a [String],
+pub fn build_sample_indices(
+    sample_names: &[String],
     rtab_path: &Path,
-) -> Result<HashMap<&'a str, usize>> {
+) -> Result<HashMap<String, usize>> {
     let mut sample_indices = HashMap::with_capacity(sample_names.len());
     for (index, sample) in sample_names.iter().enumerate() {
         if sample.is_empty() {
@@ -129,7 +118,7 @@ fn build_sample_indices<'a>(
             );
         }
 
-        if sample_indices.insert(sample.as_str(), index).is_some() {
+        if sample_indices.insert(sample.to_string(), index).is_some() {
             bail!(
                 "Panaroo Rtab '{}' header contains duplicate sample name '{sample}'",
                 rtab_path.display()
@@ -140,7 +129,7 @@ fn build_sample_indices<'a>(
     Ok(sample_indices)
 }
 
-fn read_alignment_lengths(aln_paths: &[PathBuf]) -> Result<Vec<usize>> {
+pub fn read_alignment_lengths(aln_paths: &[PathBuf]) -> Result<Vec<usize>> {
     aln_paths
         .iter()
         .map(|path| first_alignment_sequence_len(path))
@@ -181,7 +170,7 @@ fn first_alignment_sequence_len(path: &Path) -> Result<usize> {
     Ok(observed_len)
 }
 
-fn alignment_offsets(alignment_lengths: &[usize]) -> Result<Vec<u32>> {
+pub fn alignment_offsets(alignment_lengths: &[usize]) -> Result<Vec<u32>> {
     let mut offsets = Vec::with_capacity(alignment_lengths.len());
     let mut total_len = 0usize;
 
@@ -202,12 +191,12 @@ fn alignment_offsets(alignment_lengths: &[usize]) -> Result<Vec<u32>> {
 }
 
 // Parses one FASTA alignment and validates its records.
-fn parse_gene_alignment(
+pub fn parse_gene_alignment(
     path: &Path,
     gene_index: usize,
     offset: u32,
     alignment_len: usize,
-    sample_indices: &HashMap<&str, usize>,
+    sample_indices: &HashMap<String, usize>,
     paralog_mode: ParalogMode,
 ) -> Result<ParsedGeneAlignment> {
     let path = path.to_path_buf();
@@ -311,7 +300,7 @@ fn parse_gene_alignment(
 }
 
 // Drops alignments with entropy strictly greater than the requested threshold.
-fn filter_alignments_by_entropy(
+pub fn filter_alignments_by_entropy(
     panaroo_dir: &Path,
     aln_paths: Vec<PathBuf>,
     max_entropy: f64,
