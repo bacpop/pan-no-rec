@@ -109,9 +109,8 @@ mod tests {
         let loaded =
             load_genes(panaroo_dir, ParalogMode::First, None, true).expect("Test gene load failed");
         let sample_count = loaded.sample_names.len();
-        let (genome, genes) = Genome::try_from_genes(sample_count, loaded.gene_sequences).unwrap();
-        let hits = compare_loaded_alignments(sample_count, &genome, false, true);
-        (loaded.sample_names, genes, hits)
+        let hits = compare_loaded_alignments(sample_count, &loaded.genome, false, true);
+        (loaded.sample_names, loaded.gene_metadata, hits)
     }
 
     // Normalizes Rayon-collected hit order for tests that compare pair vectors.
@@ -227,10 +226,10 @@ mod tests {
         write_alignment(&dir, "gene_bg.aln.fas", ">beta\nCCCC\n>gamma\nTTTT\n");
         let loaded =
             crate::panaroo_io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
-        let sample_count = loaded.sample_names.len();
-        let (genome, _) = Genome::try_from_genes(sample_count, loaded.gene_sequences).unwrap();
 
-        let observed: Vec<_> = genome.gene_snp_counts(0, 1, false)
+        let observed: Vec<_> = loaded
+            .genome
+            .gene_snp_counts(0, 1, false)
             .into_iter()
             .map(|stats| stats.gene_index)
             .collect();
@@ -248,16 +247,17 @@ mod tests {
         let loaded =
             crate::panaroo_io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
         let sample_count = loaded.sample_names.len();
-        let (genome, _) = Genome::try_from_genes(sample_count, loaded.gene_sequences).unwrap();
 
-        let observed: Vec<_> = genome.gene_snp_counts(0, 1, false)
+        let observed: Vec<_> = loaded
+            .genome
+            .gene_snp_counts(0, 1, false)
             .into_iter()
             .map(|stats| (stats.gene_index, stats.snps, stats.length))
             .collect();
 
         assert_eq!(observed, vec![(0, 1, 4)]);
 
-        let hits = compare_loaded_alignments(sample_count, &genome, false, true);
+        let hits = compare_loaded_alignments(sample_count, &loaded.genome, false, true);
 
         assert!(!hits.contains_key(&1));
     }

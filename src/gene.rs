@@ -1,5 +1,5 @@
-use hashbrown::HashMap;
 use roaring::RoaringBitmap;
+use hashbrown::HashMap;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SampleBases {
@@ -12,22 +12,29 @@ pub(crate) struct SampleBases {
 
 impl SampleBases {
     // Encodes a sequence into per-base bitmap positions.
-    pub(crate) fn from_sequence(sequence: &[u8]) -> Self {
+    // Offset provides position of gene in whole pangenome
+    pub(crate) fn from_sequence_at(sequence: &[u8], offset: u32) -> Self {
         let mut bases = SampleBases::default();
 
         for (position, &base) in sequence.iter().enumerate() {
-            bases.insert_base(position as u32, base);
+            bases.insert_base(position as u32 + offset, base);
         }
 
         bases
     }
 
-    pub(crate) fn append_shifted(&mut self, source: SampleBases, offset: u32) {
-        append_shifted_bitmap(&mut self.a, source.a, offset);
-        append_shifted_bitmap(&mut self.c, source.c, offset);
-        append_shifted_bitmap(&mut self.g, source.g, offset);
-        append_shifted_bitmap(&mut self.t, source.t, offset);
-        append_shifted_bitmap(&mut self.gap, source.gap, offset);
+    #[cfg(test)]
+    pub(crate) fn from_sequence(sequence: &[u8]) -> Self {
+        Self::from_sequence_at(sequence, 0)
+    }
+
+    // Combines two bitmaps that have been offset
+    pub(crate) fn union_assign(&mut self, other: SampleBases) {
+        self.a |= &other.a;
+        self.c |= &other.c;
+        self.g |= &other.g;
+        self.t |= &other.t;
+        self.gap |= &other.gap;
     }
 
     pub(crate) fn matching_sites(&self, other: &Self) -> RoaringBitmap {
@@ -124,11 +131,7 @@ impl SampleBases {
     }
 }
 
-fn append_shifted_bitmap(target: &mut RoaringBitmap, source: RoaringBitmap, offset: u32) {
-    target.extend(source.into_iter().map(|position| position + offset));
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GeneMetadata {
     name: String,
     paralog_count: usize,
@@ -156,87 +159,28 @@ impl GeneMetadata {
 }
 
 #[derive(Debug)]
-pub(crate) struct Gene {
-    name: String,
-    alignment_len: usize,
-    sequences: HashMap<usize, SampleBases>,
-    paralog_count: usize,
+pub(crate) struct ParsedGeneAlignment {
+    pub(crate) gene_index: usize,
+    pub(crate) metadata: GeneMetadata,
+    pub(crate) alignment_len: usize,
+    pub(crate) offset: u32,
+    pub(crate) sequences: HashMap<usize, SampleBases>,
 }
 
-impl Gene {
-    // Builds a gene from ordered global sample indices and pre-encoded samples.
+impl ParsedGeneAlignment {
     pub(crate) fn new(
-        name: String,
+        gene_index: usize,
+        metadata: GeneMetadata,
         alignment_len: usize,
+        offset: u32,
         sequences: HashMap<usize, SampleBases>,
-        paralog_count: usize,
     ) -> Self {
-        Gene {
-            name,
+        ParsedGeneAlignment {
+            gene_index,
+            metadata,
             alignment_len,
+            offset,
             sequences,
-            paralog_count,
-        }
-    }
-
-    pub(crate) fn alignment_len(&self) -> usize {
-        self.alignment_len
-    }
-
-    pub(crate) fn into_parts(self) -> (GeneMetadata, usize, HashMap<usize, SampleBases>) {
-        (
-            GeneMetadata::new(self.name, self.paralog_count),
-            self.alignment_len,
-            self.sequences,
-        )
-    }
-
-    // Legacy gene by gene implementation for testing
-    // Can be removed later
-
-    // Counts non-matching alignment columns between two samples.
-    // Ignores sites which are both gaps
-    // If gaps == true, counts a gap vs base as a mismatch and includes in the length
-    // If gaps = false, gap positions are ignored completely
-    // Returns the number of mismatches, and the aligned length
-    #[cfg(test)]
-    pub(crate) fn snp_count(&self, sample_a: usize, sample_b: usize, gaps: bool) -> (usize, usize) {
-        let left = &self.sequences[&sample_a];
-        let right = &self.sequences[&sample_b];
-
-        let matches = left.matching_sites(right);
-        let both_gap = left.both_gap_sites(right);
-        let length = if gaps {
-            self.alignment_len - both_gap.len() as usize
-        } else {
-            self.alignment_len - left.gap.union_len(&right.gap) as usize
-        };
-
-        (length - matches.len() as usize, length)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_sample(&self, global_sample_index: usize) -> bool {
-        self.sequences.contains_key(&global_sample_index)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_samples(&self, sample_a: usize, sample_b: usize) -> bool {
-        self.has_sample(sample_a) && self.has_sample(sample_b)
-    }
-
-    // Returns the gene identifier.
-    #[cfg(test)]
-    pub(crate) fn name(&self) -> &str {
-        &self.name
-    }
-
-    #[cfg(test)]
-    pub(crate) fn paralog_count(&self) -> Option<usize> {
-        if self.paralog_count == 0 {
-            None
-        } else {
-            Some(self.paralog_count)
         }
     }
 }
@@ -245,19 +189,22 @@ impl Gene {
 mod tests {
     use super::*;
 
-    // Builds a two-sample test gene from byte sequences.
-    fn gene(sequence_a: &[u8], sequence_b: &[u8]) -> Gene {
-        let sequences = HashMap::from([
-            (0, SampleBases::from_sequence(sequence_a)),
-            (1, SampleBases::from_sequence(sequence_b)),
-        ]);
+    fn sample_snp_count(sequence_a: &[u8], sequence_b: &[u8], gaps: bool) -> (usize, usize) {
+        let left = SampleBases::from_sequence(sequence_a);
+        let right = SampleBases::from_sequence(sequence_b);
+        let matches = left.matching_sites(&right);
+        let both_gap = left.both_gap_sites(&right);
+        let length = if gaps {
+            sequence_a.len() - both_gap.len() as usize
+        } else {
+            sequence_a.len() - left.gap.union_len(&right.gap) as usize
+        };
 
-        Gene::new("gene".to_string(), sequence_a.len(), sequences, 0)
+        (length - matches.len() as usize, length)
     }
 
-    // Counts SNPs for a single-base two-sample gene using default gap handling.
     fn one_base_snp_count(left: u8, right: u8) -> (usize, usize) {
-        gene(&[left], &[right]).snp_count(0, 1, false)
+        sample_snp_count(&[left], &[right], false)
     }
 
     // Asserts bitmap membership for one encoded base.
@@ -279,26 +226,21 @@ mod tests {
     }
 
     #[test]
-    // Verifies sample presence is keyed by global sample indices.
-    fn sample_presence_uses_global_sample_indices() {
-        let sequences = HashMap::from([
-            (3, SampleBases::from_sequence(b"AAAA")),
-            (1, SampleBases::from_sequence(b"CCCC")),
-        ]);
-        let gene = Gene::new("gene".to_string(), 4, sequences, 0);
+    fn offset_sequence_encoding_shifts_bitmap_positions() {
+        let bases = SampleBases::from_sequence_at(b"AC-G", 7);
 
-        assert!(gene.has_sample(3));
-        assert!(gene.has_sample(1));
-        assert!(gene.has_samples(3, 1));
-        assert!(!gene.has_sample(0));
-        assert!(!gene.has_samples(3, 0));
+        assert!(bases.a.contains(7));
+        assert!(bases.c.contains(8));
+        assert!(bases.gap.contains(9));
+        assert!(bases.g.contains(10));
+        assert!(!bases.a.contains(0));
     }
 
     #[test]
     // Verifies exact DNA bases only match identical bases.
     fn exact_bases_match_only_themselves() {
-        assert_eq!(gene(b"ACGT", b"ACGT").snp_count(0, 1, false), (0, 4));
-        assert_eq!(gene(b"ACGT", b"TGCA").snp_count(0, 1, false), (4, 4));
+        assert_eq!(sample_snp_count(b"ACGT", b"ACGT", false), (0, 4));
+        assert_eq!(sample_snp_count(b"ACGT", b"TGCA", false), (4, 4));
     }
 
     #[test]
@@ -343,7 +285,7 @@ mod tests {
         assert_eq!(one_base_snp_count(b'B', b'A'), (1, 1));
         assert_eq!(one_base_snp_count(b'B', b'T'), (0, 1));
         assert_eq!(
-            gene(b"MRWSYKVHDB", b"AATCTGCATG").snp_count(0, 1, false),
+            sample_snp_count(b"MRWSYKVHDB", b"AATCTGCATG", false),
             (0, 10)
         );
     }
@@ -351,7 +293,7 @@ mod tests {
     #[test]
     // Verifies N and unknown non-gap bases match ordinary bases.
     fn n_and_unknown_non_gap_characters_match_any_ordinary_base() {
-        assert_eq!(gene(b"NX?z", b"ACGT").snp_count(0, 1, false), (0, 4));
+        assert_eq!(sample_snp_count(b"NX?z", b"ACGT", false), (0, 4));
         assert_eq!(one_base_snp_count(b'n', b't'), (0, 1));
         assert_eq!(one_base_snp_count(b'?', b'A'), (0, 1));
         assert_eq!(one_base_snp_count(b'X', b'C'), (0, 1));
@@ -362,9 +304,21 @@ mod tests {
     fn gap_handling_depends_on_gap_mode() {
         assert_membership(b'-', false, false, false, false, true);
 
-        let gene = gene(b"A--CGGTTT-", b"ACCCTG----");
+        assert_eq!(
+            sample_snp_count(b"A--CGGTTT-", b"ACCCTG----", false),
+            (1, 4)
+        );
+        assert_eq!(sample_snp_count(b"A--CGGTTT-", b"ACCCTG----", true), (6, 9));
+    }
 
-        assert_eq!(gene.snp_count(0, 1, false), (1, 4));
-        assert_eq!(gene.snp_count(0, 1, true), (6, 9));
+    #[test]
+    fn union_assign_merges_base_bitmaps() {
+        let mut bases = SampleBases::from_sequence_at(b"A-", 0);
+        bases.union_assign(SampleBases::from_sequence_at(b"CT", 2));
+
+        assert!(bases.a.contains(0));
+        assert!(bases.gap.contains(1));
+        assert!(bases.c.contains(2));
+        assert!(bases.t.contains(3));
     }
 }

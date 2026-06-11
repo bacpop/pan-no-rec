@@ -19,7 +19,6 @@ use dists::compare_loaded_alignments;
 
 mod gene;
 mod genome;
-use genome::Genome;
 
 mod model;
 
@@ -75,21 +74,19 @@ pub fn main() -> Result<()> {
     )?;
 
     let sample_names = genes.sample_names;
-    let sequences = genes.gene_sequences;
-    if sequences.is_empty() {
+    let genome = genes.genome;
+    let gene_metadata = genes.gene_metadata;
+    if gene_metadata.is_empty() {
         bail!("No valid genes loaded");
     } else if sample_names.is_empty() {
         bail!("Alignments are empty");
     } else {
         log::info!(
             "Read {} alignments and {} samples",
-            sequences.len(),
+            gene_metadata.len(),
             sample_names.len()
         );
     }
-
-    let (genome, gene_metadata) = Genome::try_from_genes(sample_names.len(), sequences)
-        .with_context(|| "failed to build concatenated genome")?;
 
     let n_paralogs = write_paralog_report(&args.paralog_report, &gene_metadata)?;
     if n_paralogs > 1 {
