@@ -1,6 +1,6 @@
 use crate::genome::Genome;
 use crate::get_progress_bar;
-use crate::model::{PairGeneStats, select_recombinant_gene_indices};
+use crate::model::select_recombinant_gene_indices;
 use hashbrown::HashMap;
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
@@ -84,24 +84,13 @@ fn selected_pair_hits(
     sample_b: usize,
     gaps: bool,
 ) -> Vec<(usize, SamplePair)> {
-    let pair_genes = collect_comparable_pair_gene_stats(genome, sample_a, sample_b, gaps);
+    let pair_genes = genome.gene_snp_counts(sample_a, sample_b, gaps);
     let recombinant_gene_indices = select_recombinant_gene_indices(pair_genes);
-    let pair = (sample_a, sample_b);
 
     recombinant_gene_indices
         .into_iter()
-        .map(|gene_index| (gene_index, pair))
+        .map(|gene_index| (gene_index, (sample_a, sample_b)))
         .collect()
-}
-
-// Collects SNP and length statistics for genes containing both samples.
-fn collect_comparable_pair_gene_stats(
-    genome: &Genome,
-    sample_a: usize,
-    sample_b: usize,
-    gaps: bool,
-) -> Vec<PairGeneStats> {
-    genome.gene_snp_counts(sample_a, sample_b, gaps)
 }
 
 #[cfg(test)]
@@ -241,7 +230,7 @@ mod tests {
         let sample_count = loaded.sample_names.len();
         let (genome, _) = Genome::try_from_genes(sample_count, loaded.gene_sequences).unwrap();
 
-        let observed: Vec<_> = collect_comparable_pair_gene_stats(&genome, 0, 1, false)
+        let observed: Vec<_> = genome.gene_snp_counts(0, 1, false)
             .into_iter()
             .map(|stats| stats.gene_index)
             .collect();
@@ -261,7 +250,7 @@ mod tests {
         let sample_count = loaded.sample_names.len();
         let (genome, _) = Genome::try_from_genes(sample_count, loaded.gene_sequences).unwrap();
 
-        let observed: Vec<_> = collect_comparable_pair_gene_stats(&genome, 0, 1, false)
+        let observed: Vec<_> = genome.gene_snp_counts(0, 1, false)
             .into_iter()
             .map(|stats| (stats.gene_index, stats.snps, stats.length))
             .collect();

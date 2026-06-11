@@ -179,6 +179,21 @@ impl Gene {
         }
     }
 
+    pub(crate) fn alignment_len(&self) -> usize {
+        self.alignment_len
+    }
+
+    pub(crate) fn into_parts(self) -> (GeneMetadata, usize, HashMap<usize, SampleBases>) {
+        (
+            GeneMetadata::new(self.name, self.paralog_count),
+            self.alignment_len,
+            self.sequences,
+        )
+    }
+
+    // Legacy gene by gene implementation for testing
+    // Can be removed later
+
     // Counts non-matching alignment columns between two samples.
     // Ignores sites which are both gaps
     // If gaps == true, counts a gap vs base as a mismatch and includes in the length
@@ -223,18 +238,6 @@ impl Gene {
         } else {
             Some(self.paralog_count)
         }
-    }
-
-    pub(crate) fn alignment_len(&self) -> usize {
-        self.alignment_len
-    }
-
-    pub(crate) fn into_parts(self) -> (GeneMetadata, usize, HashMap<usize, SampleBases>) {
-        (
-            GeneMetadata::new(self.name, self.paralog_count),
-            self.alignment_len,
-            self.sequences,
-        )
     }
 }
 
