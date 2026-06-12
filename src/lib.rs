@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::ThreadPoolBuilder;
 
@@ -74,9 +74,7 @@ pub fn main() -> Result<()> {
     )?;
 
     let (n_genes, n_samples) = genes.get_summary()?;
-    log::info!(
-        "Read {n_genes} alignments and {n_samples} samples"
-    );
+    log::info!("Read {n_genes} alignments and {n_samples} samples");
 
     let n_paralogs = write_paralog_report(&args.paralog_report, genes.gene_metadata())?;
     if n_paralogs > 1 {
@@ -92,12 +90,7 @@ pub fn main() -> Result<()> {
     let gene_hits = compare_loaded_alignments(n_samples, &genes, args.gaps, args.quiet);
 
     log::info!("Running recombination detection: using graphs to find genes");
-    let rows = presence_table_from_pair_hits(
-        n_samples,
-        n_genes,
-        &gene_hits,
-        args.quiet,
-    );
+    let rows = presence_table_from_pair_hits(n_samples, n_genes, &gene_hits, args.quiet);
 
     log::info!("Writing output");
     write_recombination_table(&sample_names, genes.gene_metadata(), &rows, stdout().lock())

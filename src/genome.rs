@@ -1,14 +1,14 @@
-use crate::gene::{GeneMetadata, SampleBases, ParsedGeneAlignment};
-use crate::model::PairGeneStats;
 use crate::cli::ParalogMode;
-use crate::panaroo_io::*;
+use crate::gene::{GeneMetadata, ParsedGeneAlignment, SampleBases};
 use crate::get_progress_bar;
+use crate::model::PairGeneStats;
+use crate::panaroo_io::*;
 
-use std::path::Path;
 use anyhow::{Result, bail};
-use roaring::RoaringBitmap;
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
+use std::path::Path;
 #[derive(Debug)]
 pub(crate) struct Genome {
     sample_bases: Vec<SampleBases>,
@@ -156,7 +156,6 @@ impl Genome {
     pub(crate) fn gene_metadata(&self) -> &Vec<GeneMetadata> {
         &self.gene_metadata
     }
-
 }
 
 fn gene_sort_ranks(genes: &[GeneMetadata]) -> Vec<usize> {

@@ -1,5 +1,5 @@
-use roaring::RoaringBitmap;
 use hashbrown::HashMap;
+use roaring::RoaringBitmap;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SampleBases {

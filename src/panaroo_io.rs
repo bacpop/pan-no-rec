@@ -1,5 +1,5 @@
 use crate::cli::ParalogMode;
-use crate::gene::{GeneMetadata, SampleBases, ParsedGeneAlignment};
+use crate::gene::{GeneMetadata, ParsedGeneAlignment, SampleBases};
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use hashbrown::{HashMap, hash_map::Entry};
