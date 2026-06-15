@@ -1,9 +1,11 @@
 use crate::genome::Genome;
 use crate::get_progress_bar;
+use crate::memory_profile::{MemoryProfiler, format_bytes};
 use crate::model::select_recombinant_gene_indices;
 use hashbrown::HashMap;
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
+use std::mem::size_of;
 
 pub type PairHits = HashMap<usize, Vec<(usize, usize)>>;
 type SamplePair = (usize, usize);
@@ -22,6 +24,11 @@ pub fn compare_loaded_alignments(
     // instead of parallelizing only by the outer sample index where early rows are
     // much larger than later rows.
     let sample_pair_count = sample_pair_count(sample_count);
+    let memory_profiler = MemoryProfiler::from_env();
+    memory_profiler.checkpoint(
+        "compare-start",
+        format!("samples={sample_count}, sample_pairs={sample_pair_count}"),
+    );
     let progress_bar = get_progress_bar(sample_pair_count, true, quiet);
     let gene_pair_hits: Vec<_> = (0..sample_pair_count)
         .into_par_iter()
@@ -31,12 +38,17 @@ pub fn compare_loaded_alignments(
             selected_pair_hits(genome, sample_a, sample_b, gaps)
         })
         .collect();
+    memory_profiler.checkpoint(
+        "after-flat-gene-pair-hit-collect",
+        flat_hit_vector_summary(&gene_pair_hits),
+    );
 
     // Convert to a hash map keyed by global gene index.
     let mut hits: PairHits = HashMap::new();
     for (gene, pair) in gene_pair_hits {
         hits.entry(gene).or_default().push(pair);
     }
+    memory_profiler.checkpoint("after-pair-hit-grouping", pair_hits_summary(&hits));
 
     hits
 }
@@ -91,6 +103,47 @@ fn selected_pair_hits(
         .into_iter()
         .map(|gene_index| (gene_index, (sample_a, sample_b)))
         .collect()
+}
+
+fn flat_hit_vector_summary(gene_pair_hits: &Vec<(usize, SamplePair)>) -> String {
+    let retained_bytes = gene_pair_hits.capacity() * size_of::<(usize, SamplePair)>();
+    format!(
+        "hits={}, capacity={}, element_size={}, retained_estimate={}",
+        gene_pair_hits.len(),
+        gene_pair_hits.capacity(),
+        size_of::<(usize, SamplePair)>(),
+        format_bytes(retained_bytes),
+    )
+}
+
+fn pair_hits_summary(hits: &PairHits) -> String {
+    let mut pair_counts: Vec<_> = hits.values().map(Vec::len).collect();
+    pair_counts.sort_unstable();
+
+    let gene_keys = hits.len();
+    let total_pair_hits: usize = pair_counts.iter().sum();
+    let median_pairs_per_gene = if pair_counts.is_empty() {
+        0
+    } else {
+        pair_counts[pair_counts.len() / 2]
+    };
+    let max_pairs_per_gene = pair_counts.last().copied().unwrap_or(0);
+    let pair_vec_capacity: usize = hits.values().map(Vec::capacity).sum();
+    let pair_vec_bytes = pair_vec_capacity * size_of::<SamplePair>();
+    let map_entry_bytes = hits.capacity() * (size_of::<usize>() + size_of::<Vec<SamplePair>>());
+
+    format!(
+        "gene_keys={}, map_capacity={}, total_pair_hits={}, median_pairs_per_gene={}, max_pairs_per_gene={}, pair_vec_capacity={}, pair_vec_estimate={}, map_entry_estimate={}, retained_estimate={}",
+        gene_keys,
+        hits.capacity(),
+        total_pair_hits,
+        median_pairs_per_gene,
+        max_pairs_per_gene,
+        pair_vec_capacity,
+        format_bytes(pair_vec_bytes),
+        format_bytes(map_entry_bytes),
+        format_bytes(pair_vec_bytes + map_entry_bytes),
+    )
 }
 
 #[cfg(test)]

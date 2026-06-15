@@ -129,6 +129,22 @@ impl SampleBases {
     pub(crate) fn non_gap_count(&self, alignment_len: usize) -> usize {
         alignment_len - self.gap.len() as usize
     }
+
+    pub(crate) fn serialized_size(&self) -> usize {
+        self.a.serialized_size()
+            + self.c.serialized_size()
+            + self.g.serialized_size()
+            + self.t.serialized_size()
+            + self.gap.serialized_size()
+    }
+
+    pub(crate) fn encoded_site_count(&self) -> usize {
+        self.a.len() as usize
+            + self.c.len() as usize
+            + self.g.len() as usize
+            + self.t.len() as usize
+            + self.gap.len() as usize
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
