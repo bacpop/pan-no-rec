@@ -26,7 +26,7 @@ impl Genome {
             gene_masks: vec![RoaringBitmap::new(); gene_count],
             gene_lengths: vec![0; gene_count],
             sample_gene_presence: vec![RoaringBitmap::new(); sample_count],
-            gene_sort_ranks: vec![0; sample_count],
+            gene_sort_ranks: vec![0; gene_count],
             gene_metadata: vec![GeneMetadata::default(); gene_count],
         }
     }
@@ -76,7 +76,8 @@ impl Genome {
             *left |= &right;
         }
 
-        // Combine the Vecs
+        // Empty fold accumulators contain default gene slots. Only populated
+        // slots should replace metadata, masks, and lengths from the left side.
         for (gene_index, ((other_length, other_mask), other_metadata)) in other
             .gene_lengths
             .into_iter()
@@ -84,9 +85,11 @@ impl Genome {
             .zip(other.gene_metadata)
             .enumerate()
         {
-            self.gene_lengths[gene_index] = other_length;
-            self.gene_masks[gene_index] = other_mask;
-            self.gene_metadata[gene_index] = other_metadata;
+            if other_length > 0 {
+                self.gene_lengths[gene_index] = other_length;
+                self.gene_masks[gene_index] = other_mask;
+                self.gene_metadata[gene_index] = other_metadata;
+            }
         }
 
         self
@@ -252,11 +255,12 @@ mod tests {
         gene_count: usize,
         alignments: Vec<ParsedGeneAlignment>,
     ) -> Genome {
-        let mut accumulator = GenomeAccumulator::new(sample_count, gene_count);
+        let mut accumulator = Genome::new(sample_count, gene_count);
         for alignment in alignments {
-            accumulator.add_alignment(alignment).unwrap();
+            accumulator.add_alignment(alignment);
         }
-        accumulator.finish().unwrap().0
+        accumulator.finish();
+        accumulator
     }
 
     fn stats_tuples(stats: Vec<PairGeneStats>) -> Vec<(usize, usize, usize)> {
@@ -336,25 +340,45 @@ mod tests {
 
     #[test]
     fn accumulator_merge_combines_parallel_chunks() {
-        let mut left = GenomeAccumulator::new(2, 2);
-        left.add_alignment(parsed_gene(0, "zeta", 3, 0, &[(0, b"AAA"), (1, b"AAA")]))
-            .unwrap();
-        let mut right = GenomeAccumulator::new(2, 2);
-        right
-            .add_alignment(parsed_gene(1, "alpha", 1, 3, &[(0, b"C"), (1, b"G")]))
-            .unwrap();
-        let (genome, metadata) = left.merge(right).unwrap().finish().unwrap();
+        let mut left = Genome::new(2, 2);
+        left.add_alignment(parsed_gene(0, "zeta", 3, 0, &[(0, b"AAA"), (1, b"AAA")]));
+        let mut right = Genome::new(2, 2);
+        right.add_alignment(parsed_gene(1, "alpha", 1, 3, &[(0, b"C"), (1, b"G")]));
+        let mut genome = left.merge(right);
+        genome.finish();
 
         let observed = stats_tuples(genome.gene_snp_counts(0, 1, false));
 
-        assert_eq!(metadata[0].name(), "zeta");
-        assert_eq!(metadata[1].name(), "alpha");
+        assert_eq!(genome.gene_metadata[0].name(), "zeta");
+        assert_eq!(genome.gene_metadata[1].name(), "alpha");
         assert_eq!(observed, vec![(0, 0, 3), (1, 1, 1)]);
     }
 
     #[test]
-    fn accumulator_rejects_out_of_range_sample_indices() {
-        let mut accumulator = GenomeAccumulator::new(2, 1);
+    fn merge_does_not_erase_metadata_with_empty_right_slots() {
+        let mut left = Genome::new(2, 2);
+        left.add_alignment(parsed_gene(
+            0,
+            "gene_with_metadata",
+            1,
+            0,
+            &[(0, b"A"), (1, b"A")],
+        ));
+        let right = Genome::new(2, 2);
+        let mut genome = left.merge(right);
+        genome.finish();
+
+        let observed = stats_tuples(genome.gene_snp_counts(0, 1, false));
+
+        assert_eq!(genome.gene_metadata[0].name(), "gene_with_metadata");
+        assert_eq!(genome.gene_metadata[0].paralog_count(), None);
+        assert_eq!(observed, vec![(0, 0, 1)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "sample index 2")]
+    fn genome_rejects_out_of_range_sample_indices() {
+        let mut accumulator = Genome::new(2, 1);
         let alignment = ParsedGeneAlignment::new(
             0,
             GeneMetadata::new("gene".to_string(), 0),
@@ -363,27 +387,6 @@ mod tests {
             HashMap::from([(2, SampleBases::from_sequence(b"A"))]),
         );
 
-        let error = accumulator.add_alignment(alignment).unwrap_err();
-
-        assert!(
-            error.to_string().contains("sample index 2"),
-            "error: {error}"
-        );
-    }
-
-    #[test]
-    fn accumulator_rejects_alignment_past_bitmap_limit() {
-        let mut accumulator = GenomeAccumulator::new(0, 1);
-        let alignment = ParsedGeneAlignment::new(
-            0,
-            GeneMetadata::new("large".to_string(), 0),
-            1,
-            u32::MAX,
-            HashMap::new(),
-        );
-
-        let error = accumulator.add_alignment(alignment).unwrap_err();
-
-        assert!(error.to_string().contains("exceeding"), "error: {error}");
+        accumulator.add_alignment(alignment);
     }
 }

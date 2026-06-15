@@ -574,6 +574,7 @@ fn strip_extension(name: &mut String, extension: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::genome::load_genes;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -854,12 +855,12 @@ mod tests {
         write_panaroo_alignment(&dir, "gene_a.aln.fas", ">s1\nAAAA\n>s2\nCCCC\n");
         write_panaroo_alignment(&dir, "gene_b.aln.fas", ">s2\nCCCC\n>s1\nAAAA\n");
 
-        let loaded = load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
+        let (sample_names, genome) =
+            load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
 
-        assert_eq!(loaded.sample_names, vec!["s2", "s1"]);
-        assert_eq!(loaded.gene_metadata.len(), 2);
-        let observed: Vec<_> = loaded
-            .genome
+        assert_eq!(sample_names, vec!["s2", "s1"]);
+        assert_eq!(genome.gene_metadata().len(), 2);
+        let observed: Vec<_> = genome
             .gene_snp_counts(0, 1, false)
             .into_iter()
             .map(|stats| (stats.gene_index, stats.snps, stats.length))
@@ -875,9 +876,9 @@ mod tests {
         write_panaroo_alignment(&dir, "gene_long.aln.fas", ">s1\nAAA\n>s2\nAAA\n");
         write_panaroo_alignment(&dir, "gene_short.aln.fas", ">s1\nC\n>s2\nG\n");
 
-        let loaded = load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
-        let observed: Vec<_> = loaded
-            .genome
+        let (_sample_names, genome) =
+            load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
+        let observed: Vec<_> = genome
             .gene_snp_counts(0, 1, false)
             .into_iter()
             .map(|stats| (stats.gene_index, stats.snps, stats.length))
@@ -902,24 +903,22 @@ mod tests {
             ">s3;contig_b\nCCCC\n>s1;contig_b\nAAAA\n",
         );
 
-        let loaded = load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
+        let (sample_names, genome) =
+            load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
 
-        assert_eq!(loaded.sample_names, vec!["s1", "s2", "s3"]);
-        assert_eq!(loaded.gene_metadata.len(), 2);
-        let sample_0_1: Vec<_> = loaded
-            .genome
+        assert_eq!(sample_names, vec!["s1", "s2", "s3"]);
+        assert_eq!(genome.gene_metadata().len(), 2);
+        let sample_0_1: Vec<_> = genome
             .gene_snp_counts(0, 1, false)
             .into_iter()
             .map(|stats| stats.gene_index)
             .collect();
-        let sample_0_2: Vec<_> = loaded
-            .genome
+        let sample_0_2: Vec<_> = genome
             .gene_snp_counts(0, 2, false)
             .into_iter()
             .map(|stats| stats.gene_index)
             .collect();
-        let sample_1_2: Vec<_> = loaded
-            .genome
+        let sample_1_2: Vec<_> = genome
             .gene_snp_counts(1, 2, false)
             .into_iter()
             .map(|stats| stats.gene_index)
@@ -952,9 +951,10 @@ mod tests {
             ),
         );
 
-        let loaded = load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
-        let observed: Vec<_> = loaded
-            .gene_metadata
+        let (_sample_names, genome) =
+            load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
+        let observed: Vec<_> = genome
+            .gene_metadata()
             .iter()
             .filter_map(|gene| {
                 gene.paralog_count()
@@ -980,16 +980,16 @@ mod tests {
         );
         write_panaroo_alignment(&dir, "gene_clean.aln.fas", ">s1\nAAAA\n>s2\nCCCC\n");
 
-        let loaded = load_genes(dir.path(), ParalogMode::Skip, None, true).unwrap();
+        let (_sample_names, genome) =
+            load_genes(dir.path(), ParalogMode::Skip, None, true).unwrap();
 
-        assert_eq!(loaded.gene_metadata.len(), 2);
-        assert_eq!(loaded.gene_metadata[0].name(), "gene_clean");
-        assert_eq!(loaded.gene_metadata[0].paralog_count(), None);
-        assert_eq!(loaded.gene_metadata[1].name(), "gene_dup");
-        assert_eq!(loaded.gene_metadata[1].paralog_count(), Some(1));
+        assert_eq!(genome.gene_metadata().len(), 2);
+        assert_eq!(genome.gene_metadata()[0].name(), "gene_clean");
+        assert_eq!(genome.gene_metadata()[0].paralog_count(), None);
+        assert_eq!(genome.gene_metadata()[1].name(), "gene_dup");
+        assert_eq!(genome.gene_metadata()[1].paralog_count(), Some(1));
 
-        let comparable: Vec<_> = loaded
-            .genome
+        let comparable: Vec<_> = genome
             .gene_snp_counts(0, 1, false)
             .into_iter()
             .map(|stats| stats.gene_index)

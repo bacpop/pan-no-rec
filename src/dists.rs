@@ -98,19 +98,19 @@ mod tests {
     use super::*;
     use crate::cli::ParalogMode;
     use crate::gene::GeneMetadata;
+    use crate::genome::load_genes;
     use crate::output::OutputRow;
-    use crate::panaroo_io::load_genes;
     use crate::presence_table_from_pair_hits;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn compare_alignments(panaroo_dir: &Path) -> (Vec<String>, Vec<GeneMetadata>, PairHits) {
-        let loaded =
+        let (sample_names, genome) =
             load_genes(panaroo_dir, ParalogMode::First, None, true).expect("Test gene load failed");
-        let sample_count = loaded.sample_names.len();
-        let hits = compare_loaded_alignments(sample_count, &loaded.genome, false, true);
-        (loaded.sample_names, loaded.gene_metadata, hits)
+        let gene_metadata = genome.gene_metadata().clone();
+        let hits = compare_loaded_alignments(sample_names.len(), &genome, false, true);
+        (sample_names, gene_metadata, hits)
     }
 
     // Normalizes Rayon-collected hit order for tests that compare pair vectors.
@@ -224,11 +224,10 @@ mod tests {
         write_alignment(&dir, "gene_ab.aln.fas", ">alpha\nAAAA\n>beta\nCCCC\n");
         write_alignment(&dir, "gene_ag.aln.fas", ">alpha\nAAAA\n>gamma\nTTTT\n");
         write_alignment(&dir, "gene_bg.aln.fas", ">beta\nCCCC\n>gamma\nTTTT\n");
-        let loaded =
-            crate::panaroo_io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
+        let (_sample_names, genome) =
+            load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
 
-        let observed: Vec<_> = loaded
-            .genome
+        let observed: Vec<_> = genome
             .gene_snp_counts(0, 1, false)
             .into_iter()
             .map(|stats| stats.gene_index)
@@ -244,12 +243,10 @@ mod tests {
         write_rtab(&dir, &["alpha", "beta"]);
         write_alignment(&dir, "gene_zero.aln.fas", ">alpha\n----\n>beta\nAAAA\n");
         write_alignment(&dir, "gene_positive.aln.fas", ">alpha\nAAAA\n>beta\nAAAT\n");
-        let loaded =
-            crate::panaroo_io::load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
-        let sample_count = loaded.sample_names.len();
+        let (sample_names, genome) =
+            load_genes(dir.path(), ParalogMode::First, None, true).unwrap();
 
-        let observed: Vec<_> = loaded
-            .genome
+        let observed: Vec<_> = genome
             .gene_snp_counts(0, 1, false)
             .into_iter()
             .map(|stats| (stats.gene_index, stats.snps, stats.length))
@@ -257,7 +254,7 @@ mod tests {
 
         assert_eq!(observed, vec![(0, 1, 4)]);
 
-        let hits = compare_loaded_alignments(sample_count, &loaded.genome, false, true);
+        let hits = compare_loaded_alignments(sample_names.len(), &genome, false, true);
 
         assert!(!hits.contains_key(&1));
     }
