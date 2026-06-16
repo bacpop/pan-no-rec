@@ -4,9 +4,9 @@ use crate::model::select_recombinant_gene_indices;
 use hashbrown::HashMap;
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
 
-pub type PairHits = HashMap<usize, Vec<(usize, usize)>>;
-type SamplePair = (usize, usize);
+pub type PairHits = HashMap<usize, RoaringBitmap>;
 
 // Runs pairwise comparison across all sample pairs for loaded genes.
 pub fn compare_loaded_alignments(
@@ -22,23 +22,24 @@ pub fn compare_loaded_alignments(
     // instead of parallelizing only by the outer sample index where early rows are
     // much larger than later rows.
     let sample_pair_count = sample_pair_count(sample_count);
+    assert!(
+        sample_pair_count <= u32::MAX as usize,
+        "too many sample pairs ({sample_pair_count}) for compact pair-hit storage"
+    );
     let progress_bar = get_progress_bar(sample_pair_count, true, quiet);
-    let gene_pair_hits: Vec<_> = (0..sample_pair_count)
+    (0..sample_pair_count)
         .into_par_iter()
         .progress_with(progress_bar)
-        .flat_map_iter(|pair_offset| {
+        .fold(PairHits::new, |mut hits, pair_offset| {
             let (sample_a, sample_b) = sample_pair_indices(sample_count, pair_offset);
-            selected_pair_hits(genome, sample_a, sample_b, gaps)
+            for gene_index in selected_pair_hits(genome, sample_a, sample_b, gaps) {
+                hits.entry(gene_index)
+                    .or_default()
+                    .insert(pair_offset as u32);
+            }
+            hits
         })
-        .collect();
-
-    // Convert to a hash map keyed by global gene index.
-    let mut hits: PairHits = HashMap::new();
-    for (gene, pair) in gene_pair_hits {
-        hits.entry(gene).or_default().push(pair);
-    }
-
-    hits
+        .reduce(PairHits::new, merge_pair_hits)
 }
 
 // Counts unique unordered sample pairs.
@@ -78,19 +79,16 @@ fn pairs_before_sample(sample_count: usize, sample_index: usize) -> usize {
 }
 
 // Selects recombinant genes for one sample pair and tags them with that pair.
-fn selected_pair_hits(
-    genome: &Genome,
-    sample_a: usize,
-    sample_b: usize,
-    gaps: bool,
-) -> Vec<(usize, SamplePair)> {
+fn selected_pair_hits(genome: &Genome, sample_a: usize, sample_b: usize, gaps: bool) -> Vec<usize> {
     let pair_genes = genome.gene_snp_counts(sample_a, sample_b, gaps);
-    let recombinant_gene_indices = select_recombinant_gene_indices(pair_genes);
+    select_recombinant_gene_indices(pair_genes)
+}
 
-    recombinant_gene_indices
-        .into_iter()
-        .map(|gene_index| (gene_index, (sample_a, sample_b)))
-        .collect()
+fn merge_pair_hits(mut left: PairHits, right: PairHits) -> PairHits {
+    for (gene_index, pair_offsets) in right {
+        *left.entry(gene_index).or_default() |= &pair_offsets;
+    }
+    left
 }
 
 #[cfg(test)]
@@ -113,11 +111,20 @@ mod tests {
         (sample_names, gene_metadata, hits)
     }
 
-    // Normalizes Rayon-collected hit order for tests that compare pair vectors.
-    fn sort_pair_hits(hits: &mut PairHits) {
-        for pairs in hits.values_mut() {
-            pairs.sort();
-        }
+    // Decodes compact pair offsets into sorted pair vectors for assertions.
+    fn decoded_pair_hits(
+        hits: &PairHits,
+        sample_count: usize,
+    ) -> HashMap<usize, Vec<(usize, usize)>> {
+        hits.iter()
+            .map(|(&gene_index, pair_offsets)| {
+                let pairs = pair_offsets
+                    .iter()
+                    .map(|pair_offset| sample_pair_indices(sample_count, pair_offset as usize))
+                    .collect();
+                (gene_index, pairs)
+            })
+            .collect()
     }
 
     fn infer_recombination_presence(panaroo_dir: &Path) -> Vec<OutputRow> {
@@ -168,14 +175,14 @@ mod tests {
             write_alignment(&dir, &format!("gene{mismatches:02}.aln.fas"), &contents);
         }
 
-        let mut hits = compare_alignments(dir.path());
-        sort_pair_hits(&mut hits.2);
-        let mut observed: Vec<_> = hits.2.keys().copied().collect();
+        let hits = compare_alignments(dir.path());
+        let decoded_hits = decoded_pair_hits(&hits.2, hits.0.len());
+        let mut observed: Vec<_> = decoded_hits.keys().copied().collect();
         observed.sort();
 
         assert_eq!(observed, vec![8, 9, 10, 11]);
 
-        for pairs in hits.2.values() {
+        for pairs in decoded_hits.values() {
             assert_eq!(pairs, &vec![(0, 1)]);
         }
     }
@@ -204,14 +211,14 @@ mod tests {
             write_alignment(&dir, &format!("gene{mismatches:02}.aln.fas"), &contents);
         }
 
-        let mut hits = compare_alignments(dir.path());
-        sort_pair_hits(&mut hits.2);
-        let mut observed: Vec<_> = hits.2.keys().copied().collect();
+        let hits = compare_alignments(dir.path());
+        let decoded_hits = decoded_pair_hits(&hits.2, hits.0.len());
+        let mut observed: Vec<_> = decoded_hits.keys().copied().collect();
         observed.sort();
 
         assert_eq!(observed, vec![8, 9, 10, 11]);
 
-        for pairs in hits.2.values() {
+        for pairs in decoded_hits.values() {
             assert_eq!(pairs, &vec![(0, 1)]);
         }
     }

@@ -3,6 +3,7 @@ use hashbrown::HashMap;
 use indicatif::ParallelProgressIterator;
 use petgraph::graph::{NodeIndex, UnGraph};
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
 
 use crate::dists::PairHits;
 use crate::output::OutputRow;
@@ -20,20 +21,19 @@ pub fn presence_table_from_pair_hits(
     (0..gene_count)
         .into_par_iter()
         .progress_with(progress_bar)
-        .map(|gene_index| {
-            let pairs = hits.get(&gene_index).map(Vec::as_slice).unwrap_or(&[]);
-
-            OutputRow {
-                gene_index,
-                presence: infer_gene_presence(sample_count, pairs),
-            }
+        .map(|gene_index| OutputRow {
+            gene_index,
+            presence: hits.get(&gene_index).map_or_else(
+                || vec![0; sample_count],
+                |pair_offsets| infer_gene_presence(sample_count, pair_offsets),
+            ),
         })
         .collect()
 }
 
 // Infers sample-level recombination presence from pairwise gene hits.
-pub(crate) fn infer_gene_presence(sample_count: usize, pairs: &[(usize, usize)]) -> Vec<u8> {
-    let graph = recombinant_pair_graph(sample_count, pairs);
+pub(crate) fn infer_gene_presence(sample_count: usize, pair_offsets: &RoaringBitmap) -> Vec<u8> {
+    let graph = recombinant_pair_graph(sample_count, pair_offsets);
     let mut presence = vec![0; sample_count];
 
     for sample_index in prune_recombinant_samples(&graph) {
@@ -44,11 +44,12 @@ pub(crate) fn infer_gene_presence(sample_count: usize, pairs: &[(usize, usize)])
 }
 
 // Builds an undirected graph whose edges are recombinant sample pairs.
-fn recombinant_pair_graph(sample_count: usize, pairs: &[(usize, usize)]) -> RecombinationGraph {
+fn recombinant_pair_graph(sample_count: usize, pair_offsets: &RoaringBitmap) -> RecombinationGraph {
     let mut graph = RecombinationGraph::default();
     let mut sample_nodes = HashMap::new();
 
-    for &(left_index, right_index) in pairs {
+    for pair_offset in pair_offsets {
+        let (left_index, right_index) = sample_pair_indices(sample_count, pair_offset as usize);
         if left_index >= sample_count || right_index >= sample_count || left_index == right_index {
             continue;
         }
@@ -66,6 +67,31 @@ fn recombinant_pair_graph(sample_count: usize, pairs: &[(usize, usize)]) -> Reco
     }
 
     graph
+}
+
+// Maps a flat upper-triangle offset to sample indices.
+fn sample_pair_indices(sample_count: usize, pair_offset: usize) -> (usize, usize) {
+    debug_assert!(sample_count >= 2);
+
+    let mut low = 0;
+    let mut high = sample_count.saturating_sub(2);
+    while low < high {
+        let midpoint = (low + high).div_ceil(2);
+        if pairs_before_sample(sample_count, midpoint) <= pair_offset {
+            low = midpoint;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+
+    let sample_a = low;
+    let sample_b = sample_a + 1 + pair_offset - pairs_before_sample(sample_count, sample_a);
+    (sample_a, sample_b)
+}
+
+// Counts pair offsets before a sample's row in the upper triangle.
+fn pairs_before_sample(sample_count: usize, sample_index: usize) -> usize {
+    sample_index * (2 * sample_count - sample_index - 1) / 2
 }
 
 // Prunes the graph to identify samples implicated by dense hit structure.
@@ -275,7 +301,24 @@ mod tests {
 
     // Runs presence inference from sample-index pair fixtures.
     fn presence_for_pairs(sample_count: usize, pairs: &[(usize, usize)]) -> Vec<u8> {
-        infer_gene_presence(sample_count, pairs)
+        let pair_offsets = pairs
+            .iter()
+            .map(|&(left, right)| pair_offset(sample_count, left, right))
+            .collect();
+        infer_gene_presence(sample_count, &pair_offsets)
+    }
+
+    fn pair_offset(sample_count: usize, left: usize, right: usize) -> u32 {
+        if left >= sample_count || right >= sample_count || left == right {
+            return (sample_count * sample_count) as u32;
+        }
+
+        let (left, right) = if left < right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        (pairs_before_sample(sample_count, left) + right - left - 1) as u32
     }
 
     #[test]
