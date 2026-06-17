@@ -1,6 +1,7 @@
 use crate::cli::ParalogMode;
 use crate::gene::{GeneMetadata, ParsedGeneAlignment, SampleBases};
 use crate::get_progress_bar;
+use crate::memory_profile::format_bytes;
 use crate::model::PairGeneStats;
 use crate::panaroo_io::*;
 
@@ -165,6 +166,47 @@ impl Genome {
 
     pub(crate) fn into_gene_metadata(self) -> Vec<GeneMetadata> {
         self.gene_metadata
+    }
+
+    pub(crate) fn memory_profile_summary(&self) -> String {
+        let sample_base_serialized_bytes: usize = self
+            .sample_bases
+            .iter()
+            .map(SampleBases::serialized_size)
+            .sum();
+        let sample_base_encoded_sites: usize = self
+            .sample_bases
+            .iter()
+            .map(SampleBases::encoded_site_count)
+            .sum();
+        let gene_mask_serialized_bytes: usize = self
+            .gene_masks
+            .iter()
+            .map(RoaringBitmap::serialized_size)
+            .sum();
+        let sample_presence_serialized_bytes: usize = self
+            .sample_gene_presence
+            .iter()
+            .map(RoaringBitmap::serialized_size)
+            .sum();
+        let total_alignment_len: usize = self.gene_lengths.iter().sum();
+        let metadata_name_bytes: usize = self
+            .gene_metadata
+            .iter()
+            .map(|metadata| metadata.name().len())
+            .sum();
+
+        format!(
+            "samples={}, genes={}, total_alignment_len={}, sample_base_encoded_sites={}, sample_base_serialized={}, gene_mask_serialized={}, sample_presence_serialized={}, metadata_name_bytes={}",
+            self.sample_bases.len(),
+            self.gene_lengths.len(),
+            total_alignment_len,
+            sample_base_encoded_sites,
+            format_bytes(sample_base_serialized_bytes),
+            format_bytes(gene_mask_serialized_bytes),
+            format_bytes(sample_presence_serialized_bytes),
+            format_bytes(metadata_name_bytes),
+        )
     }
 }
 
