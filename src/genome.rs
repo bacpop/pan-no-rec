@@ -4,11 +4,13 @@ use crate::get_progress_bar;
 use crate::model::PairGeneStats;
 use crate::panaroo_io::*;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use std::path::Path;
+use std::sync::mpsc::sync_channel;
+use std::thread;
 #[derive(Debug)]
 pub(crate) struct Genome {
     sample_bases: Vec<SampleBases>,
@@ -59,6 +61,7 @@ impl Genome {
         self.gene_metadata[gene_index] = metadata;
     }
 
+    #[cfg(test)]
     pub(crate) fn merge(mut self, other: Self) -> Self {
         debug_assert_eq!(self.sample_bases.len(), other.sample_bases.len());
         debug_assert_eq!(self.gene_lengths.len(), other.gene_lengths.len());
@@ -159,6 +162,10 @@ impl Genome {
     pub(crate) fn gene_metadata(&self) -> &Vec<GeneMetadata> {
         &self.gene_metadata
     }
+
+    pub(crate) fn into_gene_metadata(self) -> Vec<GeneMetadata> {
+        self.gene_metadata
+    }
 }
 
 fn gene_sort_ranks(genes: &[GeneMetadata]) -> Vec<usize> {
@@ -196,31 +203,43 @@ pub(crate) fn load_genes(
     let alignment_offsets = alignment_offsets(&alignment_lengths)?;
     let gene_count = aln_paths.len();
     let pbar = get_progress_bar(aln_paths.len(), false, quiet);
-    let mut genome_accumulator = aln_paths
+    let sample_count = sample_names.len();
+    let channel_bound = (rayon::current_num_threads() * 2).max(1);
+    let (parsed_sender, parsed_receiver) = sync_channel(channel_bound);
+    let aggregator = thread::spawn(move || {
+        let mut genome_accumulator = Genome::new(sample_count, gene_count);
+        for parsed in parsed_receiver {
+            genome_accumulator.add_alignment(parsed);
+        }
+        genome_accumulator.finish();
+        genome_accumulator
+    });
+
+    let parse_result: Result<()> = aln_paths
         .par_iter()
         .enumerate()
         .progress_with(pbar)
-        .try_fold(
-            || Genome::new(sample_names.len(), gene_count),
-            |mut accumulator, (gene_index, aln)| {
-                let parsed = parse_gene_alignment(
-                    aln,
-                    gene_index,
-                    alignment_offsets[gene_index],
-                    alignment_lengths[gene_index],
-                    &sample_indices,
-                    paralog_mode,
-                )?;
-                accumulator.add_alignment(parsed);
-                Ok::<_, anyhow::Error>(accumulator)
-            },
-        )
-        .try_reduce(
-            || Genome::new(sample_names.len(), gene_count),
-            |left, right| Ok(left.merge(right)),
-        )?;
+        .try_for_each_with(parsed_sender, |sender, (gene_index, aln)| {
+            let parsed = parse_gene_alignment(
+                aln,
+                gene_index,
+                alignment_offsets[gene_index],
+                alignment_lengths[gene_index],
+                &sample_indices,
+                paralog_mode,
+            )?;
+            sender
+                .send(parsed)
+                .map_err(|_| anyhow!("failed to send parsed alignment to genome accumulator"))?;
+            Ok::<_, anyhow::Error>(())
+        });
 
-    genome_accumulator.finish();
+    let genome_accumulator = aggregator
+        .join()
+        .map_err(|_| anyhow!("genome accumulator thread panicked"))?;
+
+    parse_result?;
+
     Ok((sample_names, genome_accumulator))
 }
 
