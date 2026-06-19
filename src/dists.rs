@@ -1,12 +1,10 @@
 use crate::genome::Genome;
 use crate::get_progress_bar;
-use crate::memory_profile::{MemoryProfiler, format_bytes};
 use crate::model::select_recombinant_gene_indices;
 use hashbrown::HashMap;
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
-use std::mem::size_of;
 
 pub type PairHits = HashMap<usize, RoaringBitmap>;
 
@@ -28,13 +26,8 @@ pub fn compare_loaded_alignments(
         sample_pair_count <= u32::MAX as usize,
         "too many sample pairs ({sample_pair_count}) for compact pair-hit storage"
     );
-    let memory_profiler = MemoryProfiler::from_env();
-    memory_profiler.checkpoint(
-        "compare-start",
-        format!("samples={sample_count}, sample_pairs={sample_pair_count}"),
-    );
     let progress_bar = get_progress_bar(sample_pair_count, true, quiet);
-    let hits = (0..sample_pair_count)
+    (0..sample_pair_count)
         .into_par_iter()
         .progress_with(progress_bar)
         .fold(PairHits::new, |mut hits, pair_offset| {
@@ -46,9 +39,7 @@ pub fn compare_loaded_alignments(
             }
             hits
         })
-        .reduce(PairHits::new, merge_pair_hits);
-    memory_profiler.checkpoint("after-compact-pair-hit-collect", pair_hits_summary(&hits));
-    hits
+        .reduce(PairHits::new, merge_pair_hits)
 }
 
 // Counts unique unordered sample pairs.
@@ -98,37 +89,6 @@ fn merge_pair_hits(mut left: PairHits, right: PairHits) -> PairHits {
         *left.entry(gene_index).or_default() |= &pair_offsets;
     }
     left
-}
-
-fn pair_hits_summary(hits: &PairHits) -> String {
-    let mut pair_counts: Vec<_> = hits
-        .values()
-        .map(|offsets| offsets.len() as usize)
-        .collect();
-    pair_counts.sort_unstable();
-
-    let gene_keys = hits.len();
-    let total_pair_hits: usize = pair_counts.iter().sum();
-    let median_pairs_per_gene = if pair_counts.is_empty() {
-        0
-    } else {
-        pair_counts[pair_counts.len() / 2]
-    };
-    let max_pairs_per_gene = pair_counts.last().copied().unwrap_or(0);
-    let bitmap_serialized_bytes: usize = hits.values().map(RoaringBitmap::serialized_size).sum();
-    let map_entry_bytes = hits.capacity() * (size_of::<usize>() + size_of::<RoaringBitmap>());
-
-    format!(
-        "gene_keys={}, map_capacity={}, total_pair_hits={}, median_pairs_per_gene={}, max_pairs_per_gene={}, bitmap_serialized={}, map_entry_estimate={}, retained_estimate={}",
-        gene_keys,
-        hits.capacity(),
-        total_pair_hits,
-        median_pairs_per_gene,
-        max_pairs_per_gene,
-        format_bytes(bitmap_serialized_bytes),
-        format_bytes(map_entry_bytes),
-        format_bytes(bitmap_serialized_bytes + map_entry_bytes),
-    )
 }
 
 #[cfg(test)]
