@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use hashbrown::HashMap;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::ThreadPoolBuilder;
 
@@ -11,7 +12,7 @@ use crate::cli::cli_args;
 mod panaroo_io;
 
 mod output;
-use output::{write_paralog_report, write_recombination_table};
+use output::{order_rows_by_gene_names, write_paralog_report, write_recombination_table};
 
 mod dists;
 use dists::compare_loaded_alignments;
@@ -24,6 +25,9 @@ mod model;
 
 mod graph;
 use graph::{GraphDebugConfig, presence_table_from_pair_hits};
+
+pub mod blocks;
+pub mod plot;
 
 fn build_graph_debug_config(args: &cli::Args) -> Result<Option<GraphDebugConfig>> {
     match (&args.debug_graph_dir, args.debug_graph_genes.is_empty()) {
@@ -107,7 +111,7 @@ pub fn main() -> Result<()> {
     let gene_metadata = genes.into_gene_metadata();
 
     log::info!("Running recombination detection: using graphs to find genes");
-    let rows = presence_table_from_pair_hits(
+    let mut rows = presence_table_from_pair_hits(
         &sample_names,
         &gene_metadata,
         &gene_hits,
@@ -115,9 +119,48 @@ pub fn main() -> Result<()> {
         args.quiet,
     )?;
 
+    let panaroo_graph_path = args.panaroo_dir.join("final_graph.gml");
+    let mut gene_sizes = None;
+    if panaroo_graph_path.is_file() {
+        log::info!("Ordering output genes using Panaroo final_graph.gml");
+        let mut panaroo_graph = blocks::load_gml(&panaroo_graph_path)?;
+        let graph_node_order = panaroo_graph.layout_core_genes(n_samples)?;
+        let graph_gene_order: Vec<_> = graph_node_order
+            .iter()
+            .map(|&node_id| {
+                panaroo_graph
+                    .node_name(node_id)
+                    .map(str::to_owned)
+                    .with_context(|| format!("Panaroo graph node {node_id} has no gene name"))
+            })
+            .collect::<Result<_>>()?;
+        let mut graph_sizes = HashMap::with_capacity(graph_node_order.len());
+        for &node_id in &graph_node_order {
+            let name = panaroo_graph
+                .node_name(node_id)
+                .with_context(|| format!("Panaroo graph node {node_id} has no gene name"))?;
+            if let Some(size) = panaroo_graph.node_size(node_id)? {
+                graph_sizes.insert(name.to_owned(), size);
+            }
+        }
+        gene_sizes = Some(graph_sizes);
+        rows = order_rows_by_gene_names(&rows, &gene_metadata, &graph_gene_order)?;
+    } else {
+        log::warn!(
+            "Panaroo graph '{}' not found; preserving alignment order",
+            panaroo_graph_path.display()
+        );
+    }
+
     log::info!("Writing output");
-    write_recombination_table(&sample_names, &gene_metadata, &rows, stdout().lock())
-        .with_context(|| "failed to write recombination table to stdout")?;
+    write_recombination_table(
+        &sample_names,
+        &gene_metadata,
+        &rows,
+        gene_sizes.as_ref(),
+        stdout().lock(),
+    )
+    .with_context(|| "failed to write recombination table to stdout")?;
     let end = Instant::now();
 
     log::info!("Complete");

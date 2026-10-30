@@ -1,5 +1,5 @@
-use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use anyhow::{Context, Result, bail};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 
@@ -33,21 +33,21 @@ pub(crate) struct BlockEdge {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct BlockGraph {
+pub struct BlockGraph {
     pub(crate) nodes: Vec<BlockNode>,
     pub(crate) edges: Vec<BlockEdge>,
     node_indices: HashMap<i64, usize>,
 }
 
 impl BlockGraph {
-    pub(crate) fn from_gml_path(path: &Path) -> Result<Self> {
+    pub fn from_gml_path(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("failed to read GML graph '{}'", path.display()))?;
         Self::from_gml_str(&contents)
             .with_context(|| format!("failed to parse GML graph '{}'", path.display()))
     }
 
-    pub(crate) fn from_gml_str(contents: &str) -> Result<Self> {
+    pub fn from_gml_str(contents: &str) -> Result<Self> {
         let tokens = tokenize(contents)?;
         let mut parser = Parser::new(tokens);
         let document = parser.parse_document()?;
@@ -62,20 +62,30 @@ impl BlockGraph {
         Self::from_graph_attributes(graph_attrs)
     }
 
-    pub(crate) fn node_index(&self, node_id: i64) -> Option<usize> {
+    pub fn node_index(&self, node_id: i64) -> Option<usize> {
         self.node_indices.get(&node_id).copied()
     }
 
-    pub(crate) fn node_coordinate(&self, node_id: i64) -> Option<usize> {
+    pub fn node_coordinate(&self, node_id: i64) -> Option<usize> {
         self.node_index(node_id)
             .and_then(|index| self.nodes[index].coordinate)
     }
 
-    pub(crate) fn assign_named_node_coordinate(
-        &mut self,
-        name: &str,
-        coordinate: usize,
-    ) -> Result<i64> {
+    pub fn node_name(&self, node_id: i64) -> Option<&str> {
+        self.node_index(node_id).and_then(|index| {
+            self.nodes[index]
+                .string_attribute("name")
+                .or(self.nodes[index].label.as_deref())
+        })
+    }
+
+    pub fn node_size(&self, node_id: i64) -> Result<Option<usize>> {
+        self.node_index(node_id)
+            .map(|index| self.nodes[index].size())
+            .transpose()
+    }
+
+    pub fn assign_named_node_coordinate(&mut self, name: &str, coordinate: usize) -> Result<i64> {
         let node_index = self.unique_node_with_string_attribute("name", name)?;
         for (index, node) in self.nodes.iter_mut().enumerate() {
             if index != node_index && node.coordinate == Some(coordinate) {
@@ -86,14 +96,206 @@ impl BlockGraph {
         Ok(self.nodes[node_index].id)
     }
 
-    pub(crate) fn assign_dnaa_coordinate_zero(&mut self) -> Result<i64> {
+    pub fn assign_dnaa_coordinate_zero(&mut self) -> Result<i64> {
         self.assign_named_node_coordinate("dnaA", 0)
     }
 
-    pub(crate) fn clear_coordinates(&mut self) {
+    pub fn clear_coordinates(&mut self) {
         for node in &mut self.nodes {
             node.coordinate = None;
         }
+    }
+
+    /// Assigns a sample-weighted, simple-path layout to the graph's genes.
+    ///
+    /// Core nodes (at least 95% of samples) are laid out first. Remaining nodes are
+    /// appended in sample-weighted simple path segments so every graph node
+    /// receives a coordinate.
+    pub fn layout_core_genes(&mut self, total_samples: usize) -> Result<Vec<i64>> {
+        if total_samples == 0 {
+            bail!("total sample count must be greater than zero");
+        }
+
+        let sizes: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|node| node.size())
+            .collect::<Result<_>>()?;
+        for (node, &size) in self.nodes.iter().zip(&sizes) {
+            if size > total_samples {
+                bail!(
+                    "GML node {} has size {size}, greater than total sample count {total_samples}",
+                    node.id
+                );
+            }
+        }
+
+        self.clear_coordinates();
+        let adjacency = self.adjacency();
+        let core: Vec<_> = sizes
+            .iter()
+            .map(|&size| is_at_least_percent(size, total_samples, CORE_PERCENT))
+            .collect();
+        let eligible: Vec<_> = sizes
+            .iter()
+            .map(|&size| is_above_percent(size, total_samples, ELIGIBLE_PERCENT))
+            .collect();
+        let mut rng = LayoutRng::default();
+        let mut ordered = Vec::with_capacity(self.nodes.len());
+        let mut used = vec![false; self.nodes.len()];
+
+        let mut core_components = connected_components(&adjacency, &core);
+        if !core_components.is_empty() {
+            let largest_size = core_components
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or_default();
+            let anchor_candidates: Vec<_> = core_components
+                .iter()
+                .enumerate()
+                .filter_map(|(index, component)| (component.len() == largest_size).then_some(index))
+                .collect();
+            let anchor_index = rng.choose_index(&anchor_candidates);
+            let anchor = core_components.swap_remove(anchor_index);
+            let anchor_set = node_mask(self.nodes.len(), &anchor);
+            let anchor_path = greedy_path(&adjacency, &anchor_set, &sizes, &mut rng);
+            append_nodes(anchor_path, &mut ordered, &mut used);
+
+            // Grow from the free end of the anchor path. Each connector is a
+            // shortest path; ties prefer greater new sample weight.
+            loop {
+                let Some(&current) = ordered.last() else {
+                    break;
+                };
+                let remaining_core: Vec<_> = core
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &is_core)| is_core && !used[index])
+                    .collect();
+                if !remaining_core.iter().any(|&present| present) {
+                    break;
+                }
+
+                let eligible_path = best_path_to_core(
+                    current,
+                    &remaining_core,
+                    &eligible,
+                    &adjacency,
+                    &sizes,
+                    &eligible,
+                    &used,
+                    &mut rng,
+                );
+                let path = if eligible_path.is_some() {
+                    eligible_path
+                } else {
+                    best_path_to_core(
+                        current,
+                        &remaining_core,
+                        &vec![true; self.nodes.len()],
+                        &adjacency,
+                        &sizes,
+                        &eligible,
+                        &used,
+                        &mut rng,
+                    )
+                };
+
+                if let Some(path) = path {
+                    append_nodes(path, &mut ordered, &mut used);
+                } else {
+                    // Disconnected core components become separate segments,
+                    // largest first. Their internal path is greedily selected.
+                    let mut disconnected = connected_components(&adjacency, &remaining_core);
+                    if disconnected.is_empty() {
+                        break;
+                    }
+                    disconnected.sort_by(|left, right| right.len().cmp(&left.len()));
+                    let largest = disconnected[0].len();
+                    let tied: Vec<_> = disconnected
+                        .iter()
+                        .take_while(|component| component.len() == largest)
+                        .collect();
+                    let chosen = rng.choose_index(&tied);
+                    let component = tied[chosen];
+                    let component_mask = node_mask(self.nodes.len(), component);
+                    let segment = greedy_path(&adjacency, &component_mask, &sizes, &mut rng);
+                    if segment.is_empty() {
+                        break;
+                    }
+                    append_nodes(segment, &mut ordered, &mut used);
+                }
+            }
+        }
+
+        // Lay out every remaining node in additional segments. This includes
+        // branch nodes and rare genes that could not be used as connectors.
+        loop {
+            let remaining_nodes: Vec<_> = used
+                .iter()
+                .enumerate()
+                .map(|(_, &is_used)| !is_used)
+                .collect();
+            if !remaining_nodes.iter().any(|&present| present) {
+                break;
+            }
+
+            let mut components = connected_components(&adjacency, &remaining_nodes);
+            components.sort_by(|left, right| {
+                let left_weight: usize = left.iter().map(|&index| sizes[index]).sum();
+                let right_weight: usize = right.iter().map(|&index| sizes[index]).sum();
+                right_weight
+                    .cmp(&left_weight)
+                    .then_with(|| right.len().cmp(&left.len()))
+            });
+            let best_weight: usize = components[0].iter().map(|&index| sizes[index]).sum();
+            let best_count = components[0].len();
+            let tied: Vec<_> = components
+                .iter()
+                .take_while(|component| {
+                    component.iter().map(|&index| sizes[index]).sum::<usize>() == best_weight
+                        && component.len() == best_count
+                })
+                .collect();
+            let component = tied[rng.choose_index(&tied)];
+            let component_mask = node_mask(self.nodes.len(), component);
+            let segment = greedy_path(&adjacency, &component_mask, &sizes, &mut rng);
+            if segment.is_empty() {
+                break;
+            }
+            append_nodes(segment, &mut ordered, &mut used);
+        }
+
+        for (coordinate, &node_index) in ordered.iter().enumerate() {
+            self.nodes[node_index].coordinate = Some(coordinate);
+        }
+
+        Ok(ordered
+            .into_iter()
+            .map(|node_index| self.nodes[node_index].id)
+            .collect())
+    }
+
+    fn adjacency(&self) -> Vec<Vec<usize>> {
+        let mut adjacency = vec![Vec::new(); self.nodes.len()];
+        for edge in &self.edges {
+            let (Some(&source), Some(&target)) = (
+                self.node_indices.get(&edge.source),
+                self.node_indices.get(&edge.target),
+            ) else {
+                continue;
+            };
+            if source != target {
+                adjacency[source].push(target);
+                adjacency[target].push(source);
+            }
+        }
+        for neighbors in &mut adjacency {
+            neighbors.sort_unstable();
+            neighbors.dedup();
+        }
+        adjacency
     }
 
     fn from_graph_attributes(attributes: &[GmlAttribute]) -> Result<Self> {
@@ -153,9 +355,262 @@ impl BlockNode {
     pub(crate) fn string_attribute(&self, key: &str) -> Option<&str> {
         optional_string(&self.attributes, key)
     }
+
+    fn size(&self) -> Result<usize> {
+        self.attributes
+            .iter()
+            .find_map(|attribute| {
+                if attribute.key == "size" {
+                    match &attribute.value {
+                        GmlValue::Integer(value) if *value >= 0 => Some(
+                            usize::try_from(*value).context("node size does not fit this platform"),
+                        ),
+                        GmlValue::Integer(value) => Some(Err(anyhow::anyhow!(
+                            "GML node {} has negative size {value}",
+                            self.id
+                        ))),
+                        _ => Some(Err(anyhow::anyhow!(
+                            "GML node {} has a non-integer size attribute",
+                            self.id
+                        ))),
+                    }
+                } else {
+                    None
+                }
+            })
+            .with_context(|| format!("GML node {} is missing its size attribute", self.id))?
+    }
 }
 
-pub(crate) fn load_gml(path: &Path) -> Result<BlockGraph> {
+const CORE_PERCENT: u128 = 95;
+const ELIGIBLE_PERCENT: u128 = 5;
+
+fn is_above_percent(size: usize, total: usize, percent: u128) -> bool {
+    (size as u128) * 100 > (total as u128) * percent
+}
+
+fn is_at_least_percent(size: usize, total: usize, percent: u128) -> bool {
+    (size as u128) * 100 >= (total as u128) * percent
+}
+
+fn node_mask(node_count: usize, nodes: &[usize]) -> Vec<bool> {
+    let mut mask = vec![false; node_count];
+    for &node in nodes {
+        mask[node] = true;
+    }
+    mask
+}
+
+fn connected_components(adjacency: &[Vec<usize>], included: &[bool]) -> Vec<Vec<usize>> {
+    let mut seen = vec![false; adjacency.len()];
+    let mut components = Vec::new();
+
+    for start in 0..adjacency.len() {
+        if !included[start] || seen[start] {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut queue = VecDeque::from([start]);
+        seen[start] = true;
+        while let Some(node) = queue.pop_front() {
+            component.push(node);
+            for &neighbor in &adjacency[node] {
+                if included[neighbor] && !seen[neighbor] {
+                    seen[neighbor] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        components.push(component);
+    }
+
+    components
+}
+
+fn append_nodes(nodes: Vec<usize>, ordered: &mut Vec<usize>, used: &mut [bool]) {
+    for node in nodes {
+        if !used[node] {
+            used[node] = true;
+            ordered.push(node);
+        }
+    }
+}
+
+// Builds a greedy simple path, trying a bounded number of randomized starts.
+fn greedy_path(
+    adjacency: &[Vec<usize>],
+    included: &[bool],
+    sizes: &[usize],
+    rng: &mut LayoutRng,
+) -> Vec<usize> {
+    let mut starts: Vec<_> = included
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &include)| include.then_some(index))
+        .collect();
+    rng.shuffle(&mut starts);
+    starts.truncate(16);
+
+    let mut best = Vec::new();
+    let mut best_weight = 0usize;
+    for start in starts {
+        let mut path = vec![start];
+        let mut in_path = vec![false; adjacency.len()];
+        in_path[start] = true;
+
+        loop {
+            let mut candidates: Vec<_> = adjacency[*path.last().unwrap()]
+                .iter()
+                .copied()
+                .filter(|&neighbor| included[neighbor] && !in_path[neighbor])
+                .collect();
+            if candidates.is_empty() {
+                break;
+            }
+            rng.shuffle(&mut candidates);
+            candidates.sort_by(|&left, &right| {
+                let left_options = adjacency[left]
+                    .iter()
+                    .filter(|&&neighbor| included[neighbor] && !in_path[neighbor])
+                    .count();
+                let right_options = adjacency[right]
+                    .iter()
+                    .filter(|&&neighbor| included[neighbor] && !in_path[neighbor])
+                    .count();
+                left_options
+                    .cmp(&right_options)
+                    .then_with(|| sizes[right].cmp(&sizes[left]))
+            });
+            let next = candidates[0];
+            path.push(next);
+            in_path[next] = true;
+        }
+
+        let weight: usize = path.iter().map(|&node| sizes[node]).sum();
+        if weight > best_weight || (weight == best_weight && path.len() > best.len()) {
+            best_weight = weight;
+            best = path;
+        }
+    }
+
+    best
+}
+
+// Finds shortest paths to unplaced core nodes, maximizing eligible sample
+// weight among equal-length routes and then choosing the best target route.
+fn best_path_to_core(
+    start: usize,
+    target: &[bool],
+    allowed: &[bool],
+    adjacency: &[Vec<usize>],
+    sizes: &[usize],
+    eligible: &[bool],
+    used: &[bool],
+    rng: &mut LayoutRng,
+) -> Option<Vec<usize>> {
+    let mut previous = vec![None; adjacency.len()];
+    let mut distance = vec![usize::MAX; adjacency.len()];
+    let mut path_weight = vec![0usize; adjacency.len()];
+    let mut queue = VecDeque::from([start]);
+    distance[start] = 0;
+
+    while let Some(node) = queue.pop_front() {
+        let mut neighbors = adjacency[node].clone();
+        rng.shuffle(&mut neighbors);
+        for neighbor in neighbors {
+            if !allowed[neighbor] || used[neighbor] {
+                continue;
+            }
+            let candidate_distance = distance[node] + 1;
+            let candidate_weight = path_weight[node]
+                + if eligible[neighbor] {
+                    sizes[neighbor]
+                } else {
+                    0
+                };
+            if distance[neighbor] == usize::MAX {
+                distance[neighbor] = candidate_distance;
+                previous[neighbor] = Some(node);
+                path_weight[neighbor] = candidate_weight;
+                queue.push_back(neighbor);
+            } else if distance[neighbor] == candidate_distance
+                && (candidate_weight > path_weight[neighbor]
+                    || (candidate_weight == path_weight[neighbor]
+                        && rng.choose_index(&[false, true]) == 0))
+            {
+                previous[neighbor] = Some(node);
+                path_weight[neighbor] = candidate_weight;
+            }
+        }
+    }
+
+    let mut candidates: Vec<_> = target
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &is_target)| {
+            (is_target && distance[index] != usize::MAX).then_some(index)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by(|&left, &right| {
+        path_weight[right]
+            .cmp(&path_weight[left])
+            .then_with(|| distance[left].cmp(&distance[right]))
+    });
+    let best_weight = path_weight[candidates[0]];
+    let best_distance = distance[candidates[0]];
+    let tied: Vec<_> = candidates
+        .into_iter()
+        .take_while(|&node| path_weight[node] == best_weight && distance[node] == best_distance)
+        .collect();
+    let target_node = tied[rng.choose_index(&tied)];
+
+    let mut path = Vec::new();
+    let mut current = target_node;
+    while current != start {
+        path.push(current);
+        current = previous[current]?;
+    }
+    path.reverse();
+    Some(path)
+}
+
+#[derive(Debug)]
+struct LayoutRng(u64);
+
+impl Default for LayoutRng {
+    fn default() -> Self {
+        // Fixed seed keeps layouts reproducible while distributing ties.
+        Self(0x9e37_79b9_7f4a_7c15)
+    }
+}
+
+impl LayoutRng {
+    fn next(&mut self) -> u64 {
+        let mut value = self.0;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.0 = value;
+        value
+    }
+
+    fn choose_index<T>(&mut self, values: &[T]) -> usize {
+        (self.next() as usize) % values.len()
+    }
+
+    fn shuffle<T>(&mut self, values: &mut [T]) {
+        for index in (1..values.len()).rev() {
+            let other = self.choose_index(&values[..=index]);
+            values.swap(index, other);
+        }
+    }
+}
+
+pub fn load_gml(path: &Path) -> Result<BlockGraph> {
     BlockGraph::from_gml_path(path)
 }
 
@@ -501,5 +956,173 @@ mod tests {
             error.to_string().contains("missing target node"),
             "error: {error}"
         );
+    }
+
+    fn layout_fixture() -> &'static str {
+        r#"
+        graph [
+          node [ id 1 size 20 name "core_a" ]
+          node [ id 2 size 1 name "rare_bridge" ]
+          node [ id 3 size 20 name "core_b" ]
+          node [ id 4 size 2 name "common_gene" ]
+          edge [ source 1 target 2 ]
+          edge [ source 2 target 3 ]
+          edge [ source 3 target 4 ]
+        ]
+        "#
+    }
+
+    #[test]
+    fn layout_connects_core_with_low_frequency_bridge_and_assigns_coordinates() {
+        let mut graph = BlockGraph::from_gml_str(layout_fixture()).unwrap();
+
+        let layout = graph.layout_core_genes(20).unwrap();
+
+        assert_eq!(layout.len(), 4);
+        assert_eq!(
+            layout
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
+        );
+        let positions: HashMap<_, _> = graph
+            .nodes
+            .iter()
+            .map(|node| (node.id, node.coordinate.unwrap()))
+            .collect();
+        assert_eq!(positions.len(), 4);
+        assert_eq!(positions[&layout[0]], 0);
+        assert_eq!(positions[&layout[3]], 3);
+        assert!(layout.contains(&2));
+    }
+
+    #[test]
+    fn layout_prefers_greater_sample_weight_between_equal_length_routes() {
+        let mut graph = BlockGraph::from_gml_str(
+            r#"
+            graph [
+              node [ id 1 size 20 ]
+              node [ id 2 size 2 ]
+              node [ id 3 size 15 ]
+              node [ id 4 size 20 ]
+              edge [ source 1 target 2 ]
+              edge [ source 2 target 4 ]
+              edge [ source 1 target 3 ]
+              edge [ source 3 target 4 ]
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let layout = graph.layout_core_genes(20).unwrap();
+
+        assert_eq!(layout[1], 3);
+    }
+
+    #[test]
+    fn layout_is_reproducible_and_uses_strict_frequency_thresholds() {
+        let mut first = BlockGraph::from_gml_str(layout_fixture()).unwrap();
+        let mut second = BlockGraph::from_gml_str(layout_fixture()).unwrap();
+
+        assert_eq!(
+            first.layout_core_genes(20).unwrap(),
+            second.layout_core_genes(20).unwrap()
+        );
+        assert!(is_at_least_percent(19, 20, CORE_PERCENT));
+        assert!(is_above_percent(20, 20, CORE_PERCENT));
+        assert!(!is_above_percent(1, 20, ELIGIBLE_PERCENT));
+        assert!(is_above_percent(2, 20, ELIGIBLE_PERCENT));
+    }
+
+    #[test]
+    fn disconnected_core_components_are_kept_as_separate_segments() {
+        let mut graph = BlockGraph::from_gml_str(
+            r#"
+            graph [
+              node [ id 1 size 20 ]
+              node [ id 2 size 20 ]
+              node [ id 3 size 20 ]
+              node [ id 4 size 20 ]
+              node [ id 5 size 20 ]
+              edge [ source 1 target 2 ]
+              edge [ source 3 target 4 ]
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let layout = graph.layout_core_genes(20).unwrap();
+
+        assert_eq!(layout.len(), 5);
+        assert_eq!(
+            layout
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            5
+        );
+        let component_pairs = [
+            std::collections::HashSet::from([1, 2]),
+            std::collections::HashSet::from([3, 4]),
+        ];
+        assert!(
+            component_pairs
+                .iter()
+                .any(|pair| { pair.contains(&layout[0]) && pair.contains(&layout[1]) })
+        );
+        assert!(
+            component_pairs
+                .iter()
+                .any(|pair| { pair.contains(&layout[2]) && pair.contains(&layout[3]) })
+        );
+        assert_eq!(layout[4], 5);
+    }
+
+    #[test]
+    fn branched_core_graph_layout_never_repeats_nodes() {
+        let mut graph = BlockGraph::from_gml_str(
+            r#"
+            graph [
+              node [ id 1 size 20 ]
+              node [ id 2 size 20 ]
+              node [ id 3 size 20 ]
+              edge [ source 1 target 2 ]
+              edge [ source 1 target 3 ]
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let layout = graph.layout_core_genes(20).unwrap();
+
+        assert_eq!(layout.len(), 3);
+        assert_eq!(
+            layout
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.coordinate.is_some())
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn layout_rejects_invalid_sample_counts_and_missing_sizes() {
+        let mut graph = BlockGraph::from_gml_str("graph [ node [ id 1 size 1 ] ]").unwrap();
+        assert!(graph.layout_core_genes(0).is_err());
+
+        let mut missing_size = BlockGraph::from_gml_str("graph [ node [ id 1 ] ]").unwrap();
+        assert!(missing_size.layout_core_genes(10).is_err());
     }
 }
