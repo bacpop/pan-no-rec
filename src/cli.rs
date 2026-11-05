@@ -64,6 +64,14 @@ pub(crate) struct Args {
     /// Don't show any messages
     #[arg(long, global = true)]
     pub quiet: bool,
+
+    /// Directory to write Cytoscape-compatible GraphML pruning snapshots
+    #[arg(long, value_name = "DIR")]
+    pub debug_graph_dir: Option<PathBuf>,
+
+    /// Gene names to write GraphML pruning snapshots for
+    #[arg(long, value_name = "GENE", value_delimiter = ',', value_parser = parse_debug_graph_gene)]
+    pub debug_graph_genes: Vec<String>,
 }
 
 // Parses and validates a positive thread count for clap.
@@ -89,6 +97,16 @@ fn parse_max_entropy(value: &str) -> Result<f64, String> {
         Ok(threshold)
     } else {
         Err("entropy threshold must be finite".to_string())
+    }
+}
+
+// Parses one non-empty gene name for graph debugging.
+fn parse_debug_graph_gene(value: &str) -> Result<String, String> {
+    let gene = value.trim();
+    if gene.is_empty() {
+        Err("debug graph gene name must not be empty".to_string())
+    } else {
+        Ok(gene.to_string())
     }
 }
 

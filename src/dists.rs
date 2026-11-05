@@ -129,7 +129,7 @@ mod tests {
 
     fn infer_recombination_presence(panaroo_dir: &Path) -> Vec<OutputRow> {
         let (sample_names, genes, hits) = compare_alignments(panaroo_dir);
-        presence_table_from_pair_hits(sample_names.len(), genes.len(), &hits, true)
+        presence_table_from_pair_hits(&sample_names, &genes, &hits, None, true).unwrap()
     }
 
     // Writes the required Panaroo Rtab header fixture.
