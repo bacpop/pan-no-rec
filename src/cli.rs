@@ -37,6 +37,18 @@ pub(crate) struct Args {
     #[arg(long, value_name = "DIR")]
     pub panaroo_dir: PathBuf,
 
+    /// Optional debug segment TSV matching stdout, or the joint TSV with --igrs
+    #[arg(long, value_name = "FILE")]
+    pub layout_segments_output: Option<PathBuf>,
+
+    /// Directory with panIGRoo output and aligned_IGR_sequences
+    #[arg(long, value_name = "DIR")]
+    pub igrs: Option<PathBuf>,
+
+    /// Output filename prefix for combined gene and IGR TSVs (required with --igrs)
+    #[arg(long, value_name = "PREFIX")]
+    pub output: Option<PathBuf>,
+
     /// Filter alignments above a certain entropy
     #[arg(long, value_name = "FLOAT", value_parser = parse_max_entropy)]
     pub max_entropy: Option<f64>,
@@ -72,6 +84,14 @@ pub(crate) struct Args {
     /// Gene names to write GraphML pruning snapshots for
     #[arg(long, value_name = "GENE", value_delimiter = ',', value_parser = parse_debug_graph_gene)]
     pub debug_graph_genes: Vec<String>,
+
+    /// Directory for recombination-free gene and core alignments (enables alignment output)
+    #[arg(long, value_name = "DIR")]
+    pub alignment_output: Option<PathBuf>,
+
+    /// Minimum sample frequency for the concatenated core alignment
+    #[arg(long, value_name = "FLOAT", default_value = "0.95", value_parser = parse_core_threshold)]
+    pub core_threshold: f64,
 }
 
 // Parses and validates a positive thread count for clap.
@@ -107,6 +127,19 @@ fn parse_debug_graph_gene(value: &str) -> Result<String, String> {
         Err("debug graph gene name must not be empty".to_string())
     } else {
         Ok(gene.to_string())
+    }
+}
+
+// Parses a core frequency threshold in the open-closed interval (0, 1].
+fn parse_core_threshold(value: &str) -> Result<f64, String> {
+    let threshold = value
+        .parse::<f64>()
+        .map_err(|source| format!("invalid core threshold: {source}"))?;
+
+    if threshold.is_finite() && threshold > 0.0 && threshold <= 1.0 {
+        Ok(threshold)
+    } else {
+        Err("core threshold must be greater than 0 and at most 1".to_string())
     }
 }
 

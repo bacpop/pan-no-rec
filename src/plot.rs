@@ -1,24 +1,48 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(about = "Plot a pan-no-rec TSV beside a Newick phylogeny")]
+#[command(about = "Plot a pan-no-rec TSV, optionally beside a Newick phylogeny")]
 struct Args {
     /// pan-no-rec recombination table
     #[arg(long, value_name = "TSV")]
     tsv: PathBuf,
 
-    /// Phylogeny in Newick format
+    /// Layout segment TSV; marks backbone gaps and resets candidate inference at every segment
+    #[arg(long, value_name = "FILE", requires = "tree")]
+    segments: Option<PathBuf>,
+
+    /// Optional phylogeny in Newick format
     #[arg(long, value_name = "NEWICK")]
-    tree: PathBuf,
+    tree: Option<PathBuf>,
 
     /// Output filename prefix; writes PREFIX.svg and PREFIX.png
     #[arg(long, value_name = "PREFIX", default_value = "recombinant_heatmap")]
     output: PathBuf,
+
+    /// Fit candidate elevated regions (requires --tree)
+    #[arg(long, requires = "tree")]
+    candidate_regions: bool,
+    /// Elevated duration means SHORT,PRIMARY,LONG; otherwise calibrated from mean non-singleton core runs (minimum 2)
+    #[arg(long, value_delimiter = ',', num_args = 1)]
+    elevated_duration_means: Vec<f64>,
+    /// Minimum and maximum background duration means
+    #[arg(
+        long,
+        value_delimiter = ',',
+        num_args = 1,
+        default_value = "1.001,1000000"
+    )]
+    background_duration_bounds: Vec<f64>,
+    #[arg(long, default_value_t = 42)]
+    candidate_seed: u64,
+    #[arg(long, default_value_t = 200)]
+    candidate_simulations: usize,
 }
 
 struct Matrix {
@@ -44,11 +68,39 @@ struct PositionedNode {
 pub fn run() -> Result<()> {
     let args = Args::parse();
     let matrix = read_matrix(&args.tsv)?;
-    let newick = fs::read_to_string(&args.tree)
-        .with_context(|| format!("failed to read Newick tree '{}'", args.tree.display()))?;
-    let tree = NewickParser::parse(&newick)
-        .with_context(|| format!("failed to parse Newick tree '{}'", args.tree.display()))?;
-    let svg = render_heatmap(&matrix, &tree)?;
+    let tree = args
+        .tree
+        .as_ref()
+        .map(|tree_path| {
+            let newick = fs::read_to_string(tree_path)
+                .with_context(|| format!("failed to read Newick tree '{}'", tree_path.display()))?;
+            NewickParser::parse(&newick)
+                .with_context(|| format!("failed to parse Newick tree '{}'", tree_path.display()))
+        })
+        .transpose()?;
+    let segments = args
+        .segments
+        .as_ref()
+        .map(|path| crate::layout_segments::read(path, &matrix.genes))
+        .transpose()?;
+    let backbone_breaks = segments
+        .as_ref()
+        .map(|data| data.backbone_breaks())
+        .unwrap_or_default();
+    let sequences = segments
+        .as_ref()
+        .map(|data| data.sequences())
+        .unwrap_or_else(|| crate::candidate::Sequence::single(matrix.genes.len()));
+    let analysis = if args.candidate_regions {
+        let counts = numerical_event_counts(&matrix, tree.as_ref().unwrap())?;
+        Some(candidate_output::analyse_with_sequences(
+            &args, &matrix, &counts, &sequences,
+        )?)
+    } else {
+        None
+    };
+    let svg =
+        render_heatmap_with_analysis(&matrix, tree.as_ref(), analysis.as_ref(), &backbone_breaks)?;
     let png = rasterize_svg(&svg)?;
     let svg_path = svg_path_for(&args.output);
     let png_path = png_path_for(&args.output);
@@ -92,8 +144,12 @@ fn rasterize_svg(svg: &str) -> Result<Vec<u8>> {
 }
 
 fn read_matrix(path: &PathBuf) -> Result<Matrix> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read pan-no-rec recombination TSV '{}'", path.display()))?;
+    let contents = fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read pan-no-rec recombination TSV '{}'",
+            path.display()
+        )
+    })?;
     let mut lines = contents.lines().filter(|line| !line.is_empty());
     let header = lines
         .next()
@@ -228,15 +284,69 @@ fn read_matrix(path: &PathBuf) -> Result<Matrix> {
     })
 }
 
-fn render_heatmap(matrix: &Matrix, tree: &TreeNode) -> Result<String> {
-    let mut tip_names = Vec::new();
-    collect_tip_names(tree, &mut tip_names)?;
-    let mut seen_tips = HashMap::with_capacity(tip_names.len());
-    for tip in &tip_names {
-        if seen_tips.insert(tip.as_str(), ()).is_some() {
+#[cfg(test)]
+fn render_heatmap(matrix: &Matrix, tree: Option<&TreeNode>) -> Result<String> {
+    render_heatmap_with_analysis(matrix, tree, None, &[])
+}
+
+fn numerical_event_counts(matrix: &Matrix, tree: &TreeNode) -> Result<Vec<usize>> {
+    let mut tips = Vec::new();
+    collect_tip_names(tree, &mut tips)?;
+    let mut seen = std::collections::HashSet::new();
+    let indices: HashMap<_, _> = matrix
+        .isolates
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    let mut order = Vec::new();
+    for tip in &tips {
+        if !seen.insert(tip) {
             bail!("Phylogeny contains duplicate tip name '{tip}'");
         }
+        order.push(
+            *indices
+                .get(tip.as_str())
+                .with_context(|| format!("Phylogeny tip '{tip}' has no matching TSV sample"))?,
+        );
     }
+    let mut clades = Vec::new();
+    let mut next = 0;
+    collect_clade_ranges(tree, &mut next, &mut clades);
+    Ok(matrix
+        .values
+        .iter()
+        .map(|row| {
+            let positive: Vec<_> = order.iter().map(|&i| row[i]).collect();
+            classify_recombinant_events(&positive, &clades).1
+        })
+        .collect())
+}
+
+#[path = "candidate_output.rs"]
+mod candidate_output;
+
+fn render_heatmap_with_analysis(
+    matrix: &Matrix,
+    tree: Option<&TreeNode>,
+    analysis: Option<&candidate_output::Analysis>,
+    backbone_breaks: &[usize],
+) -> Result<String> {
+    let tip_names = if let Some(tree) = tree {
+        let mut names = Vec::new();
+        collect_tip_names(tree, &mut names)?;
+        let mut seen_tips = HashMap::with_capacity(names.len());
+        for tip in &names {
+            if seen_tips.insert(tip.as_str(), ()).is_some() {
+                bail!("Phylogeny contains duplicate tip name '{tip}'");
+            }
+        }
+        names
+    } else {
+        let mut names = matrix.isolates.clone();
+        names.shuffle(&mut rand::thread_rng());
+        names
+    };
 
     let isolate_indices: HashMap<_, _> = matrix
         .isolates
@@ -253,7 +363,11 @@ fn render_heatmap(matrix: &Matrix, tree: &TreeNode) -> Result<String> {
     let row_height = 18.0;
     let top = 18.0;
     let tree_left = 12.0;
-    let tree_width = (heatmap_width(matrix.genes.len()) * 0.35).clamp(250.0, 1400.0);
+    let tree_width = if tree.is_some() {
+        (heatmap_width(matrix.genes.len()) * 0.35).clamp(250.0, 1400.0)
+    } else {
+        0.0
+    };
     let label_width = tip_names
         .iter()
         .map(|tip| tip.chars().count())
@@ -261,37 +375,48 @@ fn render_heatmap(matrix: &Matrix, tree: &TreeNode) -> Result<String> {
         .unwrap_or(0) as f64
         * 7.5
         + 14.0;
-    let heatmap_x = tree_left + tree_width + label_width;
+    let heatmap_x = if tree.is_some() {
+        tree_left + tree_width + label_width
+    } else {
+        tree_left + label_width
+    };
     let cell_width = cell_width(matrix.genes.len());
     let heatmap_width = matrix.genes.len() as f64 * cell_width;
-    let height = top + tip_names.len() as f64 * row_height + 8.0;
+    let heatmap_height = tip_names.len() as f64 * row_height;
+    let heatmap_bottom = top + heatmap_height;
+    let chart_height = if tree.is_some() { 132.0 } else { 0.0 };
+    let height = heatmap_bottom + chart_height + 8.0;
     let width = heatmap_x + heatmap_width + 24.0;
 
-    let mut max_depth = tree_max_depth(tree, 0.0);
-    if max_depth == 0.0 {
-        max_depth = tree_max_edges(tree, 0);
-    }
-    if max_depth == 0.0 {
-        max_depth = 1.0;
-    }
-    let mut tip_index = 0usize;
-    let positioned = position_tree(
-        tree,
-        0.0,
-        max_depth,
-        tree_left,
-        tree_width,
-        top,
-        row_height,
-        &mut tip_index,
-    );
+    let positioned = tree.map(|tree| {
+        let mut max_depth = tree_max_depth(tree, 0.0);
+        if max_depth == 0.0 {
+            max_depth = tree_max_edges(tree, 0);
+        }
+        if max_depth == 0.0 {
+            max_depth = 1.0;
+        }
+        let mut tip_index = 0usize;
+        position_tree(
+            tree,
+            0.0,
+            max_depth,
+            tree_left,
+            tree_width,
+            top,
+            row_height,
+            &mut tip_index,
+        )
+    });
 
     let mut svg = String::new();
     svg.push_str(&format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width:.0}" height="{height:.0}" viewBox="0 0 {width:.0} {height:.0}">"#
     ));
     svg.push_str(r#"<rect width="100%" height="100%" fill="white"/>"#);
-    draw_tree(&positioned, &mut svg);
+    if let Some(positioned) = &positioned {
+        draw_tree(positioned, &mut svg);
+    }
 
     for (tip_row, tip) in tip_names.iter().enumerate() {
         let y = top + (tip_row as f64 + 0.5) * row_height;
@@ -305,7 +430,7 @@ fn render_heatmap(matrix: &Matrix, tree: &TreeNode) -> Result<String> {
 
     svg.push_str(&format!(
         r##"<rect x="{heatmap_x:.1}" y="{top:.1}" width="{heatmap_width:.1}" height="{:.1}" fill="#ffffff" stroke="#bbbbbb" stroke-width="0.5"/>"##,
-        tip_names.len() as f64 * row_height
+        heatmap_height
     ));
     for (gene_index, frequency) in matrix.frequencies.iter().enumerate() {
         if let Some((present, total)) = frequency {
@@ -313,20 +438,30 @@ fn render_heatmap(matrix: &Matrix, tree: &TreeNode) -> Result<String> {
                 let x = heatmap_x + gene_index as f64 * cell_width;
                 svg.push_str(&format!(
                     r##"<rect x="{x:.1}" y="{top:.1}" width="{cell_width:.1}" height="{:.1}" fill="#eeeeee"/>"##,
-                    tip_names.len() as f64 * row_height
+                    heatmap_height
                 ));
             }
         }
     }
     let mut clade_ranges = Vec::new();
-    let mut next_tip = 0;
-    collect_clade_ranges(tree, &mut next_tip, &mut clade_ranges);
+    if let Some(tree) = tree {
+        let mut next_tip = 0;
+        collect_clade_ranges(tree, &mut next_tip, &mut clade_ranges);
+    }
+    let event_counts = tree
+        .map(|tree| numerical_event_counts(matrix, tree))
+        .transpose()?
+        .unwrap_or_default();
     for (gene_index, gene_values) in matrix.values.iter().enumerate() {
         let positive_tips: Vec<_> = tip_names
             .iter()
             .map(|tip| gene_values[isolate_indices[tip.as_str()]])
             .collect();
-        let red_tips = monophyletic_positive_tips(&positive_tips, &clade_ranges);
+        let red_tips = if tree.is_some() {
+            classify_recombinant_events(&positive_tips, &clade_ranges).0
+        } else {
+            vec![false; positive_tips.len()]
+        };
         let x = heatmap_x + gene_index as f64 * cell_width;
         for (tip_row, &is_positive) in positive_tips.iter().enumerate() {
             if is_positive {
@@ -341,6 +476,29 @@ fn render_heatmap(matrix: &Matrix, tree: &TreeNode) -> Result<String> {
                 ));
             }
         }
+    }
+
+    if let Some(analysis) = analysis {
+        candidate_output::draw_region_shading(
+            analysis,
+            heatmap_x,
+            heatmap_bottom + 17.0,
+            cell_width,
+            heatmap_width,
+            &mut svg,
+        );
+    }
+
+    if tree.is_some() {
+        draw_event_count_plot(
+            &event_counts,
+            heatmap_x,
+            heatmap_bottom + 17.0,
+            heatmap_width,
+            cell_width,
+            backbone_breaks,
+            &mut svg,
+        );
     }
 
     svg.push_str("</svg>");
@@ -400,6 +558,128 @@ fn monophyletic_positive_tips(positive: &[bool], clades: &[(usize, usize)]) -> V
         red_tips[index] = positive[index] && covered > 0;
     }
     red_tips
+}
+
+// Returns red tips and event count, counting nested positive clades once at the
+// largest all-positive clade and counting remaining positive tips individually.
+fn classify_recombinant_events(positive: &[bool], clades: &[(usize, usize)]) -> (Vec<bool>, usize) {
+    let red_tips = monophyletic_positive_tips(positive, clades);
+    let mut positive_prefix = vec![0usize; positive.len() + 1];
+    for (index, &is_positive) in positive.iter().enumerate() {
+        positive_prefix[index + 1] = positive_prefix[index] + usize::from(is_positive);
+    }
+
+    let mut qualifying: Vec<_> = clades
+        .iter()
+        .copied()
+        .filter(|&(start, end)| positive_prefix[end] - positive_prefix[start] == end - start)
+        .collect();
+    qualifying
+        .sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)));
+
+    let mut maximal_clades: Vec<(usize, usize)> = Vec::new();
+    for interval in qualifying {
+        if maximal_clades
+            .last()
+            .is_some_and(|&(start, end)| interval.0 >= start && interval.1 <= end)
+        {
+            continue;
+        }
+        maximal_clades.push(interval);
+    }
+
+    let blue_cells = positive
+        .iter()
+        .zip(&red_tips)
+        .filter(|(is_positive, is_red)| **is_positive && !**is_red)
+        .count();
+    (red_tips, maximal_clades.len() + blue_cells)
+}
+
+fn draw_event_count_plot(
+    counts: &[usize],
+    x: f64,
+    top: f64,
+    width: f64,
+    column_width: f64,
+    backbone_breaks: &[usize],
+    svg: &mut String,
+) {
+    let plot_height = 78.0;
+    let maximum = counts.iter().copied().max().unwrap_or(0).max(1);
+    let bottom = top + plot_height;
+    let axis_color = "#555555";
+
+    for tick in event_count_ticks(maximum) {
+        let y = bottom - tick as f64 / maximum as f64 * plot_height;
+        svg.push_str(&format!(
+            r##"<line x1="{x:.1}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="#dddddd" stroke-width="0.7"/><text x="{:.1}" y="{:.1}" text-anchor="end" font-family="sans-serif" font-size="10" fill="#444444">{tick}</text>"##,
+            x + width,
+            x - 7.0,
+            y + 3.5,
+        ));
+    }
+    svg.push_str(&format!(
+        r##"<line x1="{x:.1}" y1="{top:.1}" x2="{x:.1}" y2="{bottom:.1}" stroke="{axis_color}" stroke-width="0.8"/><line x1="{x:.1}" y1="{bottom:.1}" x2="{:.1}" y2="{bottom:.1}" stroke="{axis_color}" stroke-width="0.8"/><text x="{:.1}" y="{:.1}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#333333" transform="rotate(-90 {:.1} {:.1})">Recombination events per gene</text>"##,
+        x + width,
+        x - 43.0,
+        top + plot_height / 2.0,
+        x - 43.0,
+        top + plot_height / 2.0,
+    ));
+
+    for &position in backbone_breaks {
+        let gap_x = x + position as f64 * column_width;
+        svg.push_str(&format!(r##"<line data-layout-gap="{position}" x1="{gap_x:.1}" x2="{gap_x:.1}" y1="{top:.1}" y2="{bottom:.1}" stroke="#777777" stroke-opacity="0.65" stroke-dasharray="2 3" stroke-width="0.8"/>"##));
+    }
+    if counts.is_empty() {
+        return;
+    }
+    let points: Vec<_> = counts
+        .iter()
+        .enumerate()
+        .map(|(index, count)| {
+            let point_x = x + (index as f64 + 0.5) * column_width;
+            let point_y = bottom - *count as f64 / maximum as f64 * plot_height;
+            (point_x, point_y)
+        })
+        .collect();
+    let path_data = points
+        .iter()
+        .enumerate()
+        .map(|(index, (point_x, point_y))| {
+            format!(
+                "{} {point_x:.1},{point_y:.1}",
+                if index == 0 || backbone_breaks.binary_search(&index).is_ok() {
+                    "M"
+                } else {
+                    "L"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    svg.push_str(&format!(
+        r##"<path d="{path_data}" fill="none" stroke="#333333" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>"##
+    ));
+    for (i, &(point_x, point_y)) in points.iter().enumerate() {
+        if (i == 0 || backbone_breaks.binary_search(&i).is_ok())
+            && (i + 1 == points.len() || backbone_breaks.binary_search(&(i + 1)).is_ok())
+        {
+            svg.push_str(&format!(
+                r##"<circle cx="{point_x:.1}" cy="{point_y:.1}" r="2.5" fill="#333333"/>"##
+            ));
+        }
+    }
+}
+
+fn event_count_ticks(maximum: usize) -> Vec<usize> {
+    let step = maximum.div_ceil(4).max(1);
+    let mut ticks: Vec<_> = (0..=maximum / step).map(|index| index * step).collect();
+    if ticks.last().copied() != Some(maximum) {
+        ticks.push(maximum);
+    }
+    ticks
 }
 
 fn cell_width(gene_count: usize) -> f64 {
@@ -675,7 +955,7 @@ mod tests {
         };
         let tree = NewickParser::parse("(alpha:0.0001,beta:0.0002);").unwrap();
 
-        let svg = render_heatmap(&matrix, &tree).unwrap();
+        let svg = render_heatmap(&matrix, Some(&tree)).unwrap();
 
         assert!(
             svg.contains("x2=\"137.0\""),
@@ -685,7 +965,7 @@ mod tests {
             svg.contains("x2=\"262.0\""),
             "SVG did not scale beta branch: {svg}"
         );
-        assert!(svg.contains("width=\"352\" height=\"62\""));
+        assert!(svg.contains("width=\"352\" height=\"194\""));
         assert!(!svg.contains("Recombinant genes by isolate"));
     }
 
@@ -702,7 +982,7 @@ mod tests {
         };
         let tree = NewickParser::parse("(alpha:0.1,beta:0.2);").unwrap();
 
-        let svg = render_heatmap(&matrix, &tree).unwrap();
+        let svg = render_heatmap(&matrix, Some(&tree)).unwrap();
 
         assert!(
             svg.contains("x2=\"712.0\""),
@@ -719,13 +999,13 @@ mod tests {
             frequencies: vec![None],
         };
         let tree = NewickParser::parse("(alpha:0.1,beta:0.2);").unwrap();
-        let svg = render_heatmap(&matrix, &tree).unwrap();
+        let svg = render_heatmap(&matrix, Some(&tree)).unwrap();
 
         let png = rasterize_svg(&svg).unwrap();
 
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 352);
-        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 62);
+        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 194);
         assert_eq!(
             png_path_for(Path::new("plots/heatmap")),
             PathBuf::from("plots/heatmap.png")
@@ -734,5 +1014,124 @@ mod tests {
             svg_path_for(Path::new("plots/heatmap")),
             PathBuf::from("plots/heatmap.svg")
         );
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+    #[test]
+    fn numerical_counts_keep_clades_and_accessory_members() {
+        let matrix = Matrix {
+            genes: vec!["core".into(), "accessory".into()],
+            isolates: vec!["a".into(), "b".into(), "c".into()],
+            values: vec![vec![true, true, true], vec![true, false, true]],
+            frequencies: vec![Some((3, 3)), Some((1, 3))],
+        };
+        let tree = NewickParser::parse("((a,b),c);").unwrap();
+        assert_eq!(numerical_event_counts(&matrix, &tree).unwrap(), vec![1, 2]);
+        let svg = render_heatmap(&matrix, None).unwrap();
+        assert!(!svg.contains("Primary duration"));
+    }
+    #[test]
+    fn enabled_analysis_requires_tree() {
+        let args = Args::try_parse_from([
+            "plot",
+            "--tsv",
+            "x",
+            "--tree",
+            "t",
+            "--candidate-regions",
+            "--elevated-duration-means",
+            "2,4,8",
+            "--background-duration-bounds",
+            "1.01,1000",
+        ])
+        .unwrap();
+        assert_eq!(args.elevated_duration_means, vec![2.0, 4.0, 8.0]);
+        assert_eq!(args.background_duration_bounds, vec![1.01, 1000.0]);
+        assert!(Args::try_parse_from(["plot", "--tsv", "x", "--candidate-regions"]).is_err());
+    }
+    #[test]
+    fn outputs_are_deterministic_and_primary_boundaries_align() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("result");
+        let args = Args {
+            tsv: "unused".into(),
+            segments: None,
+            tree: Some("unused".into()),
+            output: prefix.clone(),
+            candidate_regions: true,
+            elevated_duration_means: vec![2.0, 4.0, 8.0],
+            background_duration_bounds: vec![1.001, 1e6],
+            candidate_seed: 42,
+            candidate_simulations: 3,
+        };
+        let counts: Vec<_> = (0..60)
+            .map(|i| {
+                if (20..28).contains(&i) {
+                    15
+                } else {
+                    usize::from(i % 5 == 0)
+                }
+            })
+            .collect();
+        let matrix = Matrix {
+            genes: (0..counts.len()).map(|i| format!("g{i}")).collect(),
+            isolates: vec![],
+            values: vec![],
+            frequencies: vec![None; counts.len()],
+        };
+        let analysis = candidate_output::analyse(&args, &matrix, &counts).unwrap();
+        let before = fs::read(path_with_suffix(&prefix, ".candidate_genes.tsv")).unwrap();
+        let diagnostics =
+            fs::read(path_with_suffix(&prefix, ".candidate_diagnostics.tsv")).unwrap();
+        candidate_output::analyse(&args, &matrix, &counts).unwrap();
+        assert_eq!(
+            before,
+            fs::read(path_with_suffix(&prefix, ".candidate_genes.tsv")).unwrap()
+        );
+        assert_eq!(
+            diagnostics,
+            fs::read(path_with_suffix(&prefix, ".candidate_diagnostics.tsv")).unwrap()
+        );
+        let mut svg = String::new();
+        candidate_output::draw_region_shading(&analysis, 100.0, 20.0, 2.0, 120.0, &mut svg);
+        assert!(svg.contains("Primary duration 4"));
+        assert!(svg.contains("sequences: 1"));
+        assert!(svg.contains("#ffd700"));
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+    #[test]
+    fn backbone_markers_align_and_singletons_are_visible() {
+        let mut svg = String::new();
+        draw_event_count_plot(&[1, 2, 3, 4], 100.0, 20.0, 8.0, 2.0, &[1, 2], &mut svg);
+        assert_eq!(svg.matches("data-layout-gap=").count(), 2);
+        assert!(svg.contains("x1=\"102.0\""));
+        assert!(svg.contains("x1=\"104.0\""));
+        let path = svg
+            .split("<path d=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert_eq!(path.matches("M ").count(), 3);
+        assert_eq!(path.matches("L ").count(), 1);
+        assert_eq!(svg.matches("<circle").count(), 2);
+        assert!(svg.find("data-layout-gap").unwrap() < svg.find("<path").unwrap());
+    }
+    #[test]
+    fn segments_need_a_tree_and_unprovided_metadata_preserves_line() {
+        assert!(Args::try_parse_from(["plot", "--tsv", "x", "--segments", "s"]).is_err());
+        let mut svg = String::new();
+        draw_event_count_plot(&[1, 2, 3], 100.0, 20.0, 6.0, 2.0, &[], &mut svg);
+        assert!(!svg.contains("data-layout-gap"));
+        assert_eq!(svg.matches("M ").count(), 1);
+        assert_eq!(svg.matches("L ").count(), 2);
     }
 }

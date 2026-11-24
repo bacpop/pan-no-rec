@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow, bail};
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 use std::thread;
 #[derive(Debug)]
@@ -193,11 +193,61 @@ pub(crate) fn load_genes(
 ) -> Result<(Vec<String>, Genome)> {
     let rtab_path = panaroo_dir.join("gene_presence_absence.Rtab");
     let sample_names = read_rtab_sample_names(&rtab_path)?;
-    let sample_indices = build_sample_indices(&sample_names, &rtab_path)?;
     let mut aln_paths = read_panaroo_dir(panaroo_dir)?;
     if let Some(threshold) = max_entropy {
         aln_paths = filter_alignments_by_entropy(panaroo_dir, aln_paths, threshold)?;
     }
+
+    let genome = load_alignments(&sample_names, &rtab_path, aln_paths, paralog_mode, quiet)?;
+    Ok((sample_names, genome))
+}
+
+// Loads qualifying panIGRoo alignments independently from the gene alignments.
+pub(crate) fn load_igrs(
+    igr_dir: &Path,
+    max_entropy: Option<f64>,
+    quiet: bool,
+) -> Result<(Vec<String>, Genome)> {
+    let rtab_path = igr_dir.join("IGR_presence_absence.Rtab");
+    let sample_names = read_rtab_sample_names(&rtab_path)?;
+    let all_igr_paths = read_igr_dir(igr_dir)?;
+    let lengths = read_alignment_lengths(&all_igr_paths)?;
+    let mut aln_paths: Vec<_> = all_igr_paths
+        .into_iter()
+        .zip(lengths)
+        .filter_map(|(path, length)| (length > 30).then_some(path))
+        .collect();
+    if aln_paths.is_empty() {
+        bail!(
+            "no IGR alignments longer than 30 bp were found in '{}'",
+            igr_dir.display()
+        );
+    }
+    if let Some(threshold) = max_entropy {
+        aln_paths = filter_alignments_by_entropy(igr_dir, aln_paths, threshold)?;
+    }
+    if aln_paths.is_empty() {
+        bail!("no IGR alignments remain after applying the requested filters");
+    }
+
+    let genome = load_alignments(
+        &sample_names,
+        &rtab_path,
+        aln_paths,
+        ParalogMode::First,
+        quiet,
+    )?;
+    Ok((sample_names, genome))
+}
+
+fn load_alignments(
+    sample_names: &[String],
+    rtab_path: &Path,
+    aln_paths: Vec<PathBuf>,
+    paralog_mode: ParalogMode,
+    quiet: bool,
+) -> Result<Genome> {
+    let sample_indices = build_sample_indices(sample_names, rtab_path)?;
 
     let alignment_lengths = read_alignment_lengths(&aln_paths)?;
     let alignment_offsets = alignment_offsets(&alignment_lengths)?;
@@ -240,7 +290,7 @@ pub(crate) fn load_genes(
 
     parse_result?;
 
-    Ok((sample_names, genome_accumulator))
+    Ok(genome_accumulator)
 }
 
 #[cfg(test)]

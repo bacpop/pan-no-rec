@@ -23,6 +23,19 @@ pub(crate) fn read_panaroo_dir(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+// Finds panIGRoo intergenic alignments in its standard output directory.
+pub(crate) fn read_igr_dir(path: &Path) -> Result<Vec<PathBuf>> {
+    let alignment_dir = path.join("aligned_IGR_sequences");
+    let paths = collect_panaroo_alignments(&alignment_dir)?;
+    if paths.is_empty() {
+        bail!(
+            "found no IGR alignment files ending in .aln.fas in '{}'",
+            alignment_dir.display()
+        );
+    }
+    Ok(paths)
+}
+
 fn collect_panaroo_alignments(dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = fs::read_dir(dir).with_context(|| {
         format!(
@@ -504,14 +517,14 @@ fn parse_csv_record(line: &str) -> Result<Vec<String>> {
 }
 
 // Normalizes a FASTA record identifier to its sample name.
-fn normalize_sample_id(record_id: &str) -> &str {
+pub(crate) fn normalize_sample_id(record_id: &str) -> &str {
     record_id
         .split_once(';')
         .map_or(record_id, |(sample, _)| sample)
 }
 
 // Opens plain or gzip-compressed alignment input for reading.
-fn open_alignment_reader(path: &Path) -> Result<Box<dyn Read>> {
+pub(crate) fn open_alignment_reader(path: &Path) -> Result<Box<dyn Read>> {
     let file = File::open(path)
         .with_context(|| format!("failed to read alignment '{}'", path.display()))?;
 
@@ -523,7 +536,7 @@ fn open_alignment_reader(path: &Path) -> Result<Box<dyn Read>> {
 }
 
 // Derives a gene name by stripping known alignment/compression suffixes.
-fn gene_name_from_path(path: &Path) -> Result<String> {
+pub(crate) fn gene_name_from_path(path: &Path) -> Result<String> {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         bail!("alignment path has no filename: '{}'", path.display());
     };

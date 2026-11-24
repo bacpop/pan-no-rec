@@ -3,6 +3,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 
+mod layout;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum GmlValue {
     Integer(i64),
@@ -37,6 +39,12 @@ pub struct BlockGraph {
     pub(crate) nodes: Vec<BlockNode>,
     pub(crate) edges: Vec<BlockEdge>,
     node_indices: HashMap<i64, usize>,
+}
+
+pub(crate) struct LayoutResult {
+    pub(crate) node_order: Vec<i64>,
+    pub(crate) backbone_len: usize,
+    pub(crate) backbone_segment_starts: Vec<usize>,
 }
 
 impl BlockGraph {
@@ -111,22 +119,22 @@ impl BlockGraph {
     /// Core nodes (at least 95% of samples) are laid out first. Remaining nodes are
     /// appended in sample-weighted simple path segments so every graph node
     /// receives a coordinate.
-    pub fn layout_core_genes(&mut self, total_samples: usize) -> Result<Vec<i64>> {
+    fn layout_baseline(&mut self, total_samples: usize) -> Result<Vec<i64>> {
         if total_samples == 0 {
             bail!("total sample count must be greater than zero");
         }
 
-        let sizes: Vec<_> = self
-            .nodes
-            .iter()
-            .map(|node| node.size())
-            .collect::<Result<_>>()?;
-        for (node, &size) in self.nodes.iter().zip(&sizes) {
+        let mut sizes = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let size = node.size()?;
             if size > total_samples {
-                bail!(
-                    "GML node {} has size {size}, greater than total sample count {total_samples}",
-                    node.id
+                log::warn!(
+                    "GML node {} has size {size}, greater than total sample count {total_samples}; capping its layout frequency at {total_samples}",
+                    node.id,
                 );
+                sizes.push(total_samples);
+            } else {
+                sizes.push(size);
             }
         }
 
@@ -229,43 +237,7 @@ impl BlockGraph {
             }
         }
 
-        // Lay out every remaining node in additional segments. This includes
-        // branch nodes and rare genes that could not be used as connectors.
-        loop {
-            let remaining_nodes: Vec<_> = used
-                .iter()
-                .enumerate()
-                .map(|(_, &is_used)| !is_used)
-                .collect();
-            if !remaining_nodes.iter().any(|&present| present) {
-                break;
-            }
-
-            let mut components = connected_components(&adjacency, &remaining_nodes);
-            components.sort_by(|left, right| {
-                let left_weight: usize = left.iter().map(|&index| sizes[index]).sum();
-                let right_weight: usize = right.iter().map(|&index| sizes[index]).sum();
-                right_weight
-                    .cmp(&left_weight)
-                    .then_with(|| right.len().cmp(&left.len()))
-            });
-            let best_weight: usize = components[0].iter().map(|&index| sizes[index]).sum();
-            let best_count = components[0].len();
-            let tied: Vec<_> = components
-                .iter()
-                .take_while(|component| {
-                    component.iter().map(|&index| sizes[index]).sum::<usize>() == best_weight
-                        && component.len() == best_count
-                })
-                .collect();
-            let component = tied[rng.choose_index(&tied)];
-            let component_mask = node_mask(self.nodes.len(), component);
-            let segment = greedy_path(&adjacency, &component_mask, &sizes, &mut rng);
-            if segment.is_empty() {
-                break;
-            }
-            append_nodes(segment, &mut ordered, &mut used);
-        }
+        layout::append_accessory(&mut ordered, &mut used, &adjacency, &sizes, &mut rng);
 
         for (coordinate, &node_index) in ordered.iter().enumerate() {
             self.nodes[node_index].coordinate = Some(coordinate);
